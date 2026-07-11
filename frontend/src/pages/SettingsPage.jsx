@@ -1,0 +1,538 @@
+import React, { useState, useEffect } from 'react';
+import { settings as settingsApi, backups, auth as authApi } from '../utils/api';
+import { loadPersonTypes } from '../utils/personTypes';
+import { useAuth } from '../contexts/AuthContext';
+import {
+  Settings, Save, AlertCircle, Check, X, RefreshCw,
+  Database, Download, Trash2, Plus, Clock, Users, KeyRound, ShieldQuestion
+} from 'lucide-react';
+
+// Admin self-service: shows the username (email), lets you change your password,
+// and set a security question so you can recover access even without email.
+function AccountRecoveryCard() {
+  const { user } = useAuth();
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+  const [pwForm, setPwForm] = useState({ current_password: '', new_password: '', confirm: '' });
+  const [pwSaving, setPwSaving] = useState(false);
+  const [rec, setRec] = useState({ recovery_question: '', recovery_answer: '' });
+  const [existingQuestion, setExistingQuestion] = useState(null);
+  const [recSaving, setRecSaving] = useState(false);
+
+  useEffect(() => {
+    authApi.myRecovery().then(d => {
+      setExistingQuestion(d.recovery_question || null);
+      if (d.recovery_question) setRec(r => ({ ...r, recovery_question: d.recovery_question }));
+    }).catch(() => {});
+  }, []);
+
+  const flash = (setter, text) => { setter(text); setTimeout(() => { setMsg(''); setErr(''); }, 6000); };
+
+  const changePassword = async (e) => {
+    e.preventDefault();
+    setErr(''); setMsg('');
+    if (pwForm.new_password !== pwForm.confirm) { flash(setErr, 'The new password and confirmation do not match.'); return; }
+    if ((pwForm.new_password || '').length < 6) { flash(setErr, 'New password must be at least 6 characters.'); return; }
+    setPwSaving(true);
+    try {
+      const d = await authApi.changePassword(pwForm.current_password, pwForm.new_password);
+      setPwForm({ current_password: '', new_password: '', confirm: '' });
+      flash(setMsg, d.message || 'Password changed.');
+    } catch (e2) { flash(setErr, e2.message || 'Could not change password.'); }
+    setPwSaving(false);
+  };
+
+  const saveRecovery = async (e) => {
+    e.preventDefault();
+    setErr(''); setMsg('');
+    setRecSaving(true);
+    try {
+      const d = await authApi.setRecovery(rec.recovery_question, rec.recovery_answer);
+      setExistingQuestion(rec.recovery_question);
+      setRec(r => ({ ...r, recovery_answer: '' }));
+      flash(setMsg, d.message || 'Security question saved.');
+    } catch (e2) { flash(setErr, e2.message || 'Could not save security question.'); }
+    setRecSaving(false);
+  };
+
+  const commonQuestions = [
+    'What was the name of your first pet?',
+    'What city were you born in?',
+    "What is your mother's maiden name?",
+    'What was the name of your first school?',
+    'What is your favorite Bible verse (book and chapter)?',
+  ];
+
+  return (
+    <div className="card mb-6">
+      <div className="flex items-center gap-2 mb-4">
+        <KeyRound size={20} className="text-primary-700" />
+        <h2 className="text-lg font-semibold text-gray-900">My Login & Recovery</h2>
+      </div>
+
+      {msg && <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg flex items-center gap-2 text-green-700 text-sm"><Check size={16} /> {msg}</div>}
+      {err && <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-sm"><AlertCircle size={16} /> {err}</div>}
+
+      <div className="mb-6">
+        <label className="label">Your username (used to sign in)</label>
+        <input className="input bg-gray-50 text-gray-700 max-w-md" value={user?.email || ''} readOnly onFocus={e => e.target.select()} />
+        <p className="text-xs text-gray-500 mt-1">This is your login email. Keep it noted somewhere safe.</p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Change password */}
+        <form onSubmit={changePassword} className="space-y-3">
+          <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-1.5"><KeyRound size={15} /> Change my password</h3>
+          <div>
+            <label className="label">Current password</label>
+            <input type="password" className="input" autoComplete="current-password" value={pwForm.current_password}
+              onChange={e => setPwForm(f => ({ ...f, current_password: e.target.value }))} required />
+          </div>
+          <div>
+            <label className="label">New password</label>
+            <input type="password" className="input" autoComplete="new-password" value={pwForm.new_password}
+              onChange={e => setPwForm(f => ({ ...f, new_password: e.target.value }))} required />
+          </div>
+          <div>
+            <label className="label">Confirm new password</label>
+            <input type="password" className="input" autoComplete="new-password" value={pwForm.confirm}
+              onChange={e => setPwForm(f => ({ ...f, confirm: e.target.value }))} required />
+          </div>
+          <button type="submit" disabled={pwSaving} className="btn-primary disabled:opacity-50">
+            {pwSaving ? <RefreshCw size={16} className="animate-spin" /> : <Save size={16} />} Update password
+          </button>
+        </form>
+
+        {/* Security question */}
+        <form onSubmit={saveRecovery} className="space-y-3">
+          <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-1.5"><ShieldQuestion size={15} /> Security question (password recovery)</h3>
+          <p className="text-xs text-gray-500">
+            Set this once. If you ever forget your password, you can reset it from the Sign-In page by answering your
+            question — no email needed. {existingQuestion ? 'A question is currently set; saving replaces it.' : 'No question set yet.'}
+          </p>
+          <div>
+            <label className="label">Question</label>
+            <input className="input" list="recovery-question-list" placeholder="Choose one or type your own"
+              value={rec.recovery_question} onChange={e => setRec(r => ({ ...r, recovery_question: e.target.value }))} required />
+            <datalist id="recovery-question-list">
+              {commonQuestions.map(q => <option key={q} value={q} />)}
+            </datalist>
+          </div>
+          <div>
+            <label className="label">Your answer</label>
+            <input className="input" placeholder="Something only you know" value={rec.recovery_answer}
+              onChange={e => setRec(r => ({ ...r, recovery_answer: e.target.value }))} required />
+            <p className="text-xs text-gray-500 mt-1">Not case-sensitive. Stored securely (encrypted), never shown again.</p>
+          </div>
+          <button type="submit" disabled={recSaving} className="btn-primary disabled:opacity-50">
+            {recSaving ? <RefreshCw size={16} className="animate-spin" /> : <Save size={16} />} Save security question
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+const settingsFields = [
+  { key: 'church_name', label: 'Church Name', type: 'text', placeholder: 'Love and Healing' },
+  { key: 'church_email', label: 'Church Email', type: 'email', placeholder: 'info@yourdomain.org' },
+  { key: 'church_phone', label: 'Church Phone', type: 'tel', placeholder: '+1 (555) 000-0000' },
+  { key: 'church_address', label: 'Church Address', type: 'text', placeholder: '123 Main Street, City, Province' },
+  { key: 'timezone', label: 'Timezone', type: 'select', options: [
+    'America/Toronto', 'America/New_York', 'America/Chicago', 'America/Denver',
+    'America/Los_Angeles', 'America/Vancouver', 'America/Edmonton', 'America/Winnipeg',
+    'America/Halifax', 'America/St_Johns', 'UTC',
+  ]},
+];
+
+export default function SettingsPage() {
+  const { isAdmin } = useAuth();
+  const [form, setForm] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [backupsList, setBackupsList] = useState([]);
+  const [backupsLoading, setBackupsLoading] = useState(false);
+  const [backupCreating, setBackupCreating] = useState(false);
+  const [personTypes, setPersonTypes] = useState([]);
+  const [ptSaving, setPtSaving] = useState(false);
+  const [ptMsg, setPtMsg] = useState('');
+
+  useEffect(() => {
+    loadSettings();
+    loadBackups();
+    loadPersonTypes(true).then(setPersonTypes).catch(() => {});
+  }, []);
+
+  const addPersonType = () => {
+    setPersonTypes([...personTypes, { value: '', label: '', auto_absent: false, builtin: false }]);
+  };
+  const updatePersonType = (idx, field, val) => {
+    setPersonTypes(personTypes.map((t, i) => i === idx ? { ...t, [field]: val } : t));
+  };
+  const removePersonType = (idx) => {
+    setPersonTypes(personTypes.filter((_, i) => i !== idx));
+  };
+  const savePersonTypes = async () => {
+    setPtSaving(true);
+    setPtMsg('');
+    setError('');
+    try {
+      const payload = personTypes
+        .filter(t => (t.label || '').trim() !== '')
+        .map(t => ({
+          value: t.value || t.label.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''),
+          label: t.label.trim(),
+          auto_absent: !!t.auto_absent,
+          builtin: !!t.builtin,
+        }));
+      const res = await settingsApi.savePersonTypes(payload);
+      setPersonTypes(res.person_types || payload);
+      await loadPersonTypes(true);
+      setPtMsg('Person types saved');
+      setTimeout(() => setPtMsg(''), 3000);
+    } catch (err) {
+      setError(err.message);
+    }
+    setPtSaving(false);
+  };
+
+  const loadSettings = async () => {
+    setLoading(true);
+    try {
+      const data = await settingsApi.get();
+      setForm(data.settings || {});
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading(false);
+  };
+
+  const loadBackups = async () => {
+    setBackupsLoading(true);
+    try {
+      const data = await backups.list();
+      setBackupsList(data.backups || []);
+    } catch (err) {
+      // silently fail for backups list
+    }
+    setBackupsLoading(false);
+  };
+
+  const handleCreateBackup = async () => {
+    setBackupCreating(true);
+    try {
+      await backups.create();
+      await loadBackups();
+      setSuccess('Backup created successfully!');
+      setTimeout(() => setSuccess(''), 3000);
+    } catch (err) {
+      setError(err.message);
+    }
+    setBackupCreating(false);
+  };
+
+  const handleDeleteBackup = async (file) => {
+    if (!window.confirm(`Are you sure you want to delete backup "${file}"?`)) return;
+    try {
+      await backups.delete(file);
+      await loadBackups();
+      setSuccess('Backup deleted.');
+      setTimeout(() => setSuccess(''), 3000);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const handleDownloadBackup = (file) => {
+    window.open(backups.downloadUrl(file));
+  };
+
+  const formatFileSize = (bytes) => {
+    if (!bytes || bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setError('');
+    setSuccess('');
+    try {
+      await settingsApi.update(form);
+      setSuccess('Settings saved successfully!');
+      setTimeout(() => setSuccess(''), 3000);
+    } catch (err) {
+      setError(err.message);
+    }
+    setSaving(false);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-700"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
+          <p className="text-gray-500 mt-1">System configuration</p>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-sm">
+          <AlertCircle size={16} />
+          {error}
+          <button onClick={() => setError('')} className="ml-auto"><X size={14} /></button>
+        </div>
+      )}
+
+      {success && (
+        <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg flex items-center gap-2 text-green-700 text-sm">
+          <Check size={16} />
+          {success}
+        </div>
+      )}
+
+      <AccountRecoveryCard />
+
+      <form onSubmit={handleSave}>
+        <div className="card">
+          <div className="flex items-center gap-2 mb-6">
+            <Settings size={20} className="text-primary-700" />
+            <h2 className="text-lg font-semibold text-gray-900">Church Information</h2>
+          </div>
+
+          <div className="space-y-4 max-w-xl">
+            {settingsFields.map(field => (
+              <div key={field.key}>
+                <label className="label">{field.label}</label>
+                {field.type === 'select' ? (
+                  <select
+                    className="input"
+                    value={form[field.key] || ''}
+                    onChange={(e) => setForm(f => ({ ...f, [field.key]: e.target.value }))}
+                  >
+                    {field.options.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type={field.type}
+                    className="input"
+                    value={form[field.key] || ''}
+                    onChange={(e) => setForm(f => ({ ...f, [field.key]: e.target.value }))}
+                    placeholder={field.placeholder}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-3 mt-8 pt-6 border-t border-gray-100">
+            <button type="submit" disabled={saving} className="btn-primary">
+              {saving ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Save size={16} />}
+              Save Settings
+            </button>
+            <button type="button" onClick={loadSettings} className="btn-secondary">
+              <RefreshCw size={16} /> Reset
+            </button>
+          </div>
+        </div>
+      </form>
+
+      {/* Person Types */}
+      <div className="card mt-6">
+        <div className="flex items-center gap-2 mb-1">
+          <Users size={20} className="text-primary-700" />
+          <h2 className="text-lg font-semibold text-gray-900">Person Types</h2>
+        </div>
+        <p className="text-sm text-gray-500 mb-4">
+          Categories you can assign to people (e.g. Church Member, Non-Member Attendee, Visitor, Ministry Partner).
+          Turn on "Auto-absent" for a type if people of that type should be automatically marked absent when a
+          service ends without a check-in. You can add your own custom types below.
+        </p>
+
+        <div className="space-y-2">
+          <div className="hidden sm:grid grid-cols-12 gap-2 text-xs font-semibold text-gray-500 uppercase px-1">
+            <div className="col-span-6">Type name</div>
+            <div className="col-span-4 text-center">Auto-mark absent</div>
+            <div className="col-span-2"></div>
+          </div>
+          {personTypes.map((t, idx) => (
+            <div key={idx} className="grid grid-cols-12 gap-2 items-center">
+              <div className="col-span-12 sm:col-span-6">
+                <input
+                  type="text"
+                  className="input"
+                  value={t.label}
+                  placeholder="Type name"
+                  onChange={e => updatePersonType(idx, 'label', e.target.value)}
+                />
+              </div>
+              <div className="col-span-8 sm:col-span-4 flex items-center justify-start sm:justify-center gap-2">
+                <label className="inline-flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4"
+                    checked={!!t.auto_absent}
+                    onChange={e => updatePersonType(idx, 'auto_absent', e.target.checked)}
+                  />
+                  Auto-absent
+                </label>
+              </div>
+              <div className="col-span-4 sm:col-span-2 flex justify-end">
+                {(t.value === 'church_member' || t.value === 'non_member_attendee') ? (
+                  <span className="text-[11px] text-gray-400 px-2">Required</span>
+                ) : (
+                  <button type="button" onClick={() => removePersonType(idx)} className="text-red-600 hover:bg-red-50 p-2 rounded-lg" title="Remove type">
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 mt-4">
+          <button type="button" onClick={addPersonType} className="btn-secondary">
+            <Plus size={16} /> Add Type
+          </button>
+          <button type="button" onClick={savePersonTypes} disabled={ptSaving} className="btn-primary">
+            {ptSaving ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Save size={16} />}
+            Save Person Types
+          </button>
+          {ptMsg && <span className="text-sm text-green-600 flex items-center gap-1"><Check size={14} /> {ptMsg}</span>}
+        </div>
+      </div>
+
+      {/* System Info */}
+      <div className="card mt-6">
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">System Information</h2>
+        <div className="space-y-2 text-sm">
+          <div className="flex justify-between py-2 border-b border-gray-50">
+            <span className="text-gray-500">System Version</span>
+            <span className="text-gray-900 font-medium">1.0.0</span>
+          </div>
+          <div className="flex justify-between py-2 border-b border-gray-50">
+            <span className="text-gray-500">Backend</span>
+            <span className="text-gray-900 font-medium">PHP 8+ REST API</span>
+          </div>
+          <div className="flex justify-between py-2 border-b border-gray-50">
+            <span className="text-gray-500">Frontend</span>
+            <span className="text-gray-900 font-medium">React + Tailwind CSS</span>
+          </div>
+          <div className="flex justify-between py-2">
+            <span className="text-gray-500">Database</span>
+            <span className="text-gray-900 font-medium">MySQL</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Database Backups */}
+      <div className="card mt-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Database size={20} className="text-primary-700" />
+            <h2 className="text-lg font-semibold text-gray-900">
+              Database Backups
+              {backupsList.length > 0 && (
+                <span className="ml-2 text-sm font-normal text-gray-500">({backupsList.length})</span>
+              )}
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={handleCreateBackup}
+            disabled={backupCreating}
+            className="btn-primary"
+          >
+            {backupCreating ? (
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />
+            ) : (
+              <Plus size={16} />
+            )}
+            Create Backup
+          </button>
+        </div>
+
+        {backupsLoading ? (
+          <div className="flex items-center justify-center py-8">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-700"></div>
+          </div>
+        ) : backupsList.length === 0 ? (
+          <div className="text-center py-8 text-gray-400">
+            <Database size={32} className="mx-auto mb-2 opacity-50" />
+            <p className="text-sm">No backups yet. Create one to get started.</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {backupsList.map((backup) => (
+              <div
+                key={backup.file}
+                className="flex items-center justify-between py-3 px-4 bg-gray-50 rounded-lg"
+              >
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate">{backup.file}</p>
+                  <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
+                    <span>{formatFileSize(backup.size)}</span>
+                    {backup.date && (
+                      <span className="flex items-center gap-1">
+                        <Clock size={12} />
+                        {backup.date}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 ml-4">
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadBackup(backup.file)}
+                    className="btn-secondary text-xs !py-1.5 !px-2.5"
+                    title="Download"
+                  >
+                    <Download size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteBackup(backup.file)}
+                    className="btn-secondary text-xs !py-1.5 !px-2.5 text-red-600 hover:text-red-700 hover:border-red-300"
+                    title="Delete"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+          <h3 className="text-sm font-semibold text-blue-800 mb-2">How to Restore a Backup</h3>
+          <ol className="text-sm text-blue-700 space-y-1 list-decimal list-inside">
+            <li>Download the backup file (.sql) to your computer</li>
+            <li>Log in to your Hostinger panel (hpanel.hostinger.com)</li>
+            <li>Go to Databases &gt; phpMyAdmin</li>
+            <li>Select the church database from the left sidebar</li>
+            <li>Click the "Import" tab at the top</li>
+            <li>Choose the downloaded .sql backup file</li>
+            <li>Click "Import" to restore the database</li>
+          </ol>
+          <p className="text-xs text-blue-600 mt-2">
+            Note: Restoring will replace current data with the backup data. Make sure to create a fresh backup before restoring an older one.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}

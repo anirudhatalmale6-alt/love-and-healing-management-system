@@ -1,0 +1,268 @@
+<?php
+/**
+ * Love and Healing Management System
+ * Dashboard API - Statistics and overview data
+ */
+
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/auth.php';
+
+$currentUser = authenticate();
+$db = getDB();
+
+$isAdmin = in_array($currentUser['role'], ['pastor', 'admin']);
+
+// Get user permissions for non-admin users
+$userPerms = [];
+if (!$isAdmin) {
+    $permStmt = $db->prepare("SELECT permission FROM user_permissions WHERE user_id = ?");
+    $permStmt->execute([$currentUser['user_id']]);
+    $userPerms = array_column($permStmt->fetchAll(), 'permission');
+}
+
+$hasPerm = function($section) use ($isAdmin, $userPerms) {
+    if ($isAdmin) return true;
+    if (empty($userPerms)) return true;
+    return in_array($section, $userPerms);
+};
+
+// Run auto-status once per day (on first dashboard load of the day)
+try {
+    $lastRun = $db->query("SELECT value FROM settings WHERE `key` = 'auto_status_last_run'")->fetchColumn();
+    $today = date('Y-m-d');
+    if ($lastRun !== $today) {
+        // Active -> Inactive (3 months no attendance)
+        $db->exec("
+            UPDATE members SET status = 'inactive'
+            WHERE status = 'active'
+            AND id NOT IN (
+                SELECT DISTINCT a.member_id FROM attendance a
+                JOIN services s ON s.id = a.service_id
+                WHERE (a.status = 'present' OR a.status = 'late')
+                AND s.date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
+            )
+            AND created_at < DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
+        ");
+        // Inactive -> Forsaking (6 months no attendance)
+        $db->exec("
+            UPDATE members SET status = 'forsaking'
+            WHERE status = 'inactive'
+            AND id NOT IN (
+                SELECT DISTINCT a.member_id FROM attendance a
+                JOIN services s ON s.id = a.service_id
+                WHERE (a.status = 'present' OR a.status = 'late')
+                AND s.date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+            )
+            AND created_at < DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+        ");
+        // Forsaking -> Restored (3+ months of attendance)
+        $db->exec("
+            UPDATE members SET status = 'restored'
+            WHERE status = 'forsaking'
+            AND (
+                SELECT COUNT(DISTINCT DATE_FORMAT(s.date, '%Y-%m'))
+                FROM attendance a
+                JOIN services s ON s.id = a.service_id
+                WHERE a.member_id = members.id
+                AND (a.status = 'present' OR a.status = 'late')
+                AND s.date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
+            ) >= 3
+        ");
+        // Mark today as last run
+        $db->prepare("INSERT INTO settings (`key`, value) VALUES ('auto_status_last_run', ?) ON DUPLICATE KEY UPDATE value = ?")->execute([$today, $today]);
+    }
+} catch (Exception $e) {
+    error_log('Auto-status error: ' . $e->getMessage());
+}
+
+// Total members by status + community count
+$memberStats = ['total' => 0, 'active' => 0, 'inactive' => 0, 'revoked' => 0, 'restored' => 0, 'forsaking' => 0, 'community' => 0];
+$newThisMonth = 0;
+if ($hasPerm('members')) {
+    $memberStats = $db->query("
+        SELECT
+            COUNT(*) as total,
+            COUNT(CASE WHEN status = 'active' THEN 1 END) as active,
+            COUNT(CASE WHEN status = 'inactive' THEN 1 END) as inactive,
+            COUNT(CASE WHEN status = 'revoked' THEN 1 END) as revoked,
+            COUNT(CASE WHEN status = 'restored' THEN 1 END) as restored,
+            COUNT(CASE WHEN status = 'forsaking' THEN 1 END) as forsaking,
+            COUNT(CASE WHEN person_type = 'community' THEN 1 END) as community,
+            COUNT(CASE WHEN person_type = 'church_member' OR person_type IS NULL THEN 1 END) as church_members,
+            COUNT(CASE WHEN person_type = 'non_member_attendee' THEN 1 END) as non_member_attendees,
+            COUNT(CASE WHEN person_type = 'companion' THEN 1 END) as companions
+        FROM members
+    ")->fetch();
+
+    $newThisMonth = $db->query("
+        SELECT COUNT(*) as count FROM members
+        WHERE created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+    ")->fetch()['count'];
+}
+
+// Average attendance (last 4 weeks)
+$avgAttendance = 0;
+$attendanceTrend = [];
+if ($hasPerm('attendance')) {
+    $avgAttendance = $db->query("
+        SELECT AVG(total_people) as avg_attendance
+        FROM (
+            SELECT s.id,
+                GREATEST(
+                    COALESCE(s.head_count, 0),
+                    COUNT(CASE WHEN a.status = 'present' OR a.status = 'late' THEN 1 END) + COALESCE(s.visitor_count, 0)
+                ) as total_people
+            FROM services s
+            LEFT JOIN attendance a ON a.service_id = s.id
+            WHERE s.date >= DATE_SUB(CURDATE(), INTERVAL 4 WEEK)
+            GROUP BY s.id
+        ) sub
+    ")->fetch()['avg_attendance'];
+
+    $attendanceTrend = $db->query("
+        SELECT s.id, s.name, s.date, s.type,
+            COUNT(CASE WHEN a.status = 'present' OR a.status = 'late' THEN 1 END) as attended,
+            COUNT(a.id) as total_marked,
+            COALESCE(s.visitor_count, 0) as visitor_count,
+            COALESCE(s.head_count, 0) as head_count
+        FROM services s
+        LEFT JOIN attendance a ON a.service_id = s.id
+        WHERE s.date <= CURDATE()
+        GROUP BY s.id
+        ORDER BY s.date DESC, s.time DESC
+        LIMIT 8
+    ")->fetchAll();
+    $attendanceTrend = array_reverse($attendanceTrend);
+}
+
+// Upcoming services (next 5)
+$upcomingServices = [];
+if ($hasPerm('services')) {
+    $upcomingServices = $db->query("
+        SELECT * FROM services
+        WHERE date >= CURDATE()
+        ORDER BY date ASC, time ASC
+        LIMIT 5
+    ")->fetchAll();
+}
+
+// Birthday members this month + upcoming week
+$birthdays = [];
+$birthdaysThisWeek = [];
+$anniversaries = [];
+if ($hasPerm('members')) {
+    $birthdays = $db->query("
+        SELECT id, first_name, last_name, date_of_birth
+        FROM members
+        WHERE status IN ('active', 'restored')
+        AND MONTH(date_of_birth) = MONTH(CURDATE())
+        ORDER BY DAY(date_of_birth) ASC
+        LIMIT 15
+    ")->fetchAll();
+
+    $birthdaysThisWeek = $db->query("
+        SELECT id, first_name, last_name, date_of_birth
+        FROM members
+        WHERE status IN ('active', 'restored')
+        AND date_of_birth IS NOT NULL
+        AND DATE_FORMAT(date_of_birth, '%m-%d') BETWEEN DATE_FORMAT(CURDATE(), '%m-%d') AND DATE_FORMAT(DATE_ADD(CURDATE(), INTERVAL 7 DAY), '%m-%d')
+        ORDER BY DATE_FORMAT(date_of_birth, '%m-%d') ASC
+        LIMIT 10
+    ")->fetchAll();
+
+    $anniversaries = $db->query("
+        SELECT id, first_name, last_name, wedding_date
+        FROM members
+        WHERE status IN ('active', 'restored')
+        AND wedding_date IS NOT NULL
+        AND MONTH(wedding_date) = MONTH(CURDATE())
+        ORDER BY DAY(wedding_date) ASC
+        LIMIT 10
+    ")->fetchAll();
+}
+
+// Giving stats (this month)
+$givingStats = ['this_month' => 0, 'last_month' => 0, 'this_year' => 0];
+$expenseStats = ['this_month' => 0, 'this_year' => 0];
+if ($hasPerm('finance')) {
+    try {
+        $givingStats['this_month'] = (float)$db->query("SELECT COALESCE(SUM(amount), 0) FROM donations WHERE donation_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')")->fetchColumn();
+        $givingStats['last_month'] = (float)$db->query("SELECT COALESCE(SUM(amount), 0) FROM donations WHERE donation_date >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m-01') AND donation_date < DATE_FORMAT(CURDATE(), '%Y-%m-01')")->fetchColumn();
+        $givingStats['this_year'] = (float)$db->query("SELECT COALESCE(SUM(amount), 0) FROM donations WHERE donation_date >= DATE_FORMAT(CURDATE(), '%Y-01-01')")->fetchColumn();
+    } catch (Exception $e) {}
+    try {
+        $expenseStats['this_month'] = (float)$db->query("SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE expense_date >= DATE_FORMAT(CURDATE(), '%Y-%m-01')")->fetchColumn();
+        $expenseStats['this_year'] = (float)$db->query("SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE expense_date >= DATE_FORMAT(CURDATE(), '%Y-01-01')")->fetchColumn();
+    } catch (Exception $e) {}
+}
+
+// Pending changes count (for admin notification)
+$pendingCount = 0;
+if ($isAdmin) {
+    try {
+        $pendingCount = (int)$db->query("SELECT COUNT(*) as cnt FROM pending_changes WHERE status = 'pending'")->fetch()['cnt'];
+    } catch (Exception $e) {}
+}
+
+// Department reports pending review (admin)
+$pendingReports = 0;
+if ($isAdmin) {
+    try {
+        $pendingReports = (int)$db->query("SELECT COUNT(*) FROM department_reports WHERE status = 'submitted'")->fetchColumn();
+    } catch (Exception $e) {}
+}
+
+// Services without attendance (upcoming that haven't been filled)
+$servicesWithoutAttendance = [];
+if ($hasPerm('services') || $hasPerm('attendance')) {
+    $servicesWithoutAttendance = $db->query("
+        SELECT s.id, s.name, s.date, s.time, s.type
+        FROM services s
+        LEFT JOIN attendance a ON a.service_id = s.id
+        WHERE s.date < CURDATE()
+        AND s.date >= DATE_SUB(CURDATE(), INTERVAL 2 WEEK)
+        GROUP BY s.id
+        HAVING COUNT(a.id) = 0
+        ORDER BY s.date DESC
+        LIMIT 5
+    ")->fetchAll();
+}
+
+// Pledge alerts
+$pledgeAlerts = 0;
+if ($hasPerm('finance')) {
+    try {
+        $pledgeAlerts = (int)$db->query("SELECT COUNT(*) FROM pledges WHERE status = 'active'")->fetchColumn();
+    } catch (Exception $e) {}
+}
+
+jsonResponse([
+    'members' => [
+        'total' => (int)($memberStats['total'] ?? 0),
+        'active' => (int)($memberStats['active'] ?? 0),
+        'inactive' => (int)($memberStats['inactive'] ?? 0),
+        'revoked' => (int)($memberStats['revoked'] ?? 0),
+        'restored' => (int)($memberStats['restored'] ?? 0),
+        'forsaking' => (int)($memberStats['forsaking'] ?? 0),
+        'community' => (int)($memberStats['community'] ?? 0),
+        'church_members' => (int)($memberStats['church_members'] ?? 0),
+        'non_member_attendees' => (int)($memberStats['non_member_attendees'] ?? 0),
+        'companions' => (int)($memberStats['companions'] ?? 0),
+        'new_this_month' => (int)$newThisMonth,
+    ],
+    'attendance' => [
+        'avg_last_4_weeks' => $avgAttendance ? round((float)$avgAttendance, 1) : 0,
+        'trend' => $attendanceTrend,
+    ],
+    'upcoming_services' => $upcomingServices,
+    'birthdays_this_month' => $birthdays,
+    'birthdays_this_week' => $birthdaysThisWeek,
+    'anniversaries_this_month' => $anniversaries,
+    'pending_changes_count' => $pendingCount,
+    'pending_reports_count' => $pendingReports,
+    'services_without_attendance' => $servicesWithoutAttendance,
+    'giving' => $givingStats,
+    'expenses' => $expenseStats,
+    'active_pledges' => $pledgeAlerts,
+    'user_permissions' => $isAdmin ? ['all'] : $userPerms,
+]);

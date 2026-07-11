@@ -1,0 +1,48 @@
+RewriteEngine On
+RewriteBase /system/
+
+# Disable LiteSpeed cache
+<IfModule LiteSpeed>
+CacheLookup off
+</IfModule>
+
+# Force HTTPS (uncomment for production)
+# RewriteCond %{HTTPS} off
+# RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+# API Routes - forward to PHP files
+RewriteRule ^api/install$ api/install.php [L,QSA]
+RewriteRule ^api/auth$ api/auth.php [L,QSA]
+RewriteRule ^api/users$ api/users.php [L,QSA]
+RewriteRule ^api/users/([0-9]+)$ api/users.php?id=$1 [L,QSA]
+RewriteRule ^api/members$ api/members.php [L,QSA]
+RewriteRule ^api/members/([0-9]+)$ api/members.php?id=$1 [L,QSA]
+RewriteRule ^api/services$ api/services.php [L,QSA]
+RewriteRule ^api/services/([0-9]+)$ api/services.php?id=$1 [L,QSA]
+RewriteRule ^api/attendance$ api/attendance.php [L,QSA]
+RewriteRule ^api/attendance/([0-9]+)$ api/attendance.php?id=$1 [L,QSA]
+RewriteRule ^api/dashboard$ api/dashboard.php [L,QSA]
+RewriteRule ^api/settings$ api/settings.php [L,QSA]
+RewriteRule ^api/groups$ api/groups.php [L,QSA]
+RewriteRule ^api/groups/([0-9]+)$ api/groups.php?id=$1 [L,QSA]
+RewriteRule ^api/households$ api/households.php [L,QSA]
+RewriteRule ^api/households/([0-9]+)$ api/households.php?id=$1 [L,QSA]
+RewriteRule ^api/reports$ api/reports.php [L,QSA]
+RewriteRule ^api/periods$ api/periods.php [L,QSA]
+RewriteRule ^api/periods/([0-9]+)$ api/periods.php?id=$1 [L,QSA]
+RewriteRule ^api/pending$ api/pending.php [L,QSA]
+RewriteRule ^api/pending/([0-9]+)$ api/pending.php?id=$1 [L,QSA]
+RewriteRule ^api/checklist$ api/checklist.php [L,QSA]
+RewriteRule ^api/checklist/([0-9]+)$ api/checklist.php?id=$1 [L,QSA]
+RewriteRule ^api/backup$ api/backup.php [L,QSA]
+RewriteRule ^api/schedules$ api/schedules.php [L,QSA]
+RewriteRule ^api/schedules/([0-9]+)$ api/schedules.php?id=$1 [L,QSA]
+RewriteRule ^api/departments$ api/departments.php [L,QSA]
+RewriteRule ^api/departments/([0-9]+)$ api/departments.php?id=$1 [L,QSA]
+
+# Don't rewrite existing files or directories
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Route everything else to PHP wrapper (bypasses LiteSpeed cache)
+RewriteRule ^(.*)$ public/index.php [L]
