@@ -74,7 +74,7 @@ export default function ForgotPasswordPage() {
         {/* Logo */}
         <div className="text-center mb-8">
           <img src={import.meta.env.BASE_URL + 'logo.png'} alt="Love and Healing" className="h-16 mx-auto mb-3" />
-          <p className="text-primary-200 mt-1">Love and Healing Management System</p>
+          <p className="text-primary-200 mt-1">Church Management System</p>
         </div>
 
         {/* Card */}
@@ -182,7 +182,7 @@ export default function ForgotPasswordPage() {
           </div>
         </div>
 
-        <p className="text-center text-primary-300 text-sm mt-6">Love and Healing Management System v1.0</p>
+        <p className="text-center text-primary-300 text-sm mt-6">Church Management System v1.0</p>
       </div>
     </div>
   );

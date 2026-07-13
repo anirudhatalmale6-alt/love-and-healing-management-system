@@ -73,8 +73,15 @@ Open in a browser:
 https://yourdomain.org/system/public/install
 ```
 
-It creates all the tables and asks for the first administrator account (name, email,
-password). That is the account used to log in afterwards.
+It reads `schema.sql`, creates all 49 tables and creates the first administrator account.
+The page then shows the login details:
+
+```
+email:    admin@yourdomain.org
+password: Admin123!
+```
+
+Change that password straight after the first login (Settings -> Account).
 
 **6. Log in**
 
@@ -98,6 +105,21 @@ npm run build      # writes the updated app into ../public
 ```
 
 Then upload the new `public/` folder to the server.
+
+---
+
+## Groups and departments
+
+Groups are sorted into three kinds, and a person can be in as many groups as needed:
+
+- **Serving teams** - the teams that run a department and file a report after each service.
+  Each one is tied to the department it reports for (Choir -> Worship Team, and so on).
+- **Leadership & governance** - the boards and offices that oversee the church.
+- **Ministries & fellowship** - the groups people simply belong to. They do not file a
+  service report.
+
+Add, rename, re-file and delete groups from the Groups page. Deleting a group removes only
+that group from its people - everything else they belong to is kept.
 
 ---
 

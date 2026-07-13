@@ -1,7 +1,7 @@
 <?php
 require_once __DIR__ . '/config.php';
 $secret = $_GET['key'] ?? '';
-if ($secret !== 'hitc-migrate-2026') { jsonResponse(['error' => 'Unauthorized'], 403); }
+if ($secret !== 'lh-migrate-2026') { jsonResponse(['error' => 'Unauthorized'], 403); }
 $db = getDB();
 $results = [];
 try {

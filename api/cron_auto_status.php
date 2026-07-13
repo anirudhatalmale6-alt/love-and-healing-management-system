@@ -2,7 +2,7 @@
 require_once __DIR__ . '/config.php';
 
 $secret = $_GET['key'] ?? '';
-if ($secret !== 'hitc-auto-status-2026') {
+if ($secret !== 'lh-auto-status-2026') {
     http_response_code(403);
     echo json_encode(['error' => 'Unauthorized']);
     exit();

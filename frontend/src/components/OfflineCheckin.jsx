@@ -6,10 +6,10 @@ import {
   RefreshCw, User, Clock, AlertCircle, Loader, UserPlus
 } from 'lucide-react';
 
-const LS_MEMBERS_KEY = 'hitc_offline_members';
-const LS_SERVICES_KEY = 'hitc_offline_services';
-const LS_CHECKINS_KEY = 'hitc_offline_checkins';
-const LS_SYNC_TIME_KEY = 'hitc_offline_sync_time';
+const LS_MEMBERS_KEY = 'lh_offline_members';
+const LS_SERVICES_KEY = 'lh_offline_services';
+const LS_CHECKINS_KEY = 'lh_offline_checkins';
+const LS_SYNC_TIME_KEY = 'lh_offline_sync_time';
 
 function getStoredMembers() {
   try {

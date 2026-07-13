@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
-if (($_GET['key'] ?? '') !== 'hitc-ytdiag-2026') { http_response_code(403); echo 'no'; exit; }
+if (($_GET['key'] ?? '') !== 'lh-ytdiag-2026') { http_response_code(403); echo 'no'; exit; }
 
 $binDir = dirname(__DIR__) . '/bin';
 $ytdlp = $binDir . '/yt-dlp';

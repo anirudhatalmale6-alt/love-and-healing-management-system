@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
-if (($_GET['key'] ?? '') !== 'hitc-ffdiag-2026') { http_response_code(403); echo 'no'; exit; }
+if (($_GET['key'] ?? '') !== 'lh-ffdiag-2026') { http_response_code(403); echo 'no'; exit; }
 
 $binDir = dirname(__DIR__) . '/bin';
 $ffmpeg = $binDir . '/ffmpeg';

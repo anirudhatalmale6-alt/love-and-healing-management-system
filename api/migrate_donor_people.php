@@ -6,13 +6,13 @@
  * is NOT a known expense vendor / business), create a People record and link
  * the donation(s) to it. Businesses like "Amazon" are left as donor_name.
  *
- * Run once:  /system/api/migrate_donor_people.php?key=hitc-donor-people-2026
+ * Run once:  /system/api/migrate_donor_people.php?key=lh-donor-people-2026
  * Remove from server afterwards.
  */
 require __DIR__ . '/config.php';
 header('Content-Type: application/json');
 
-if (($_GET['key'] ?? '') !== 'hitc-donor-people-2026') {
+if (($_GET['key'] ?? '') !== 'lh-donor-people-2026') {
     http_response_code(403);
     echo json_encode(['error' => 'forbidden']);
     exit;
