@@ -316,6 +316,11 @@ export const finance = {
   deleteExpense: (id) => request('finance.php', { method: 'DELETE', params: { action: 'expense', id } }),
   approveExpense: (id) => request('finance.php', { method: 'PUT', params: { action: 'approve_expense', id } }),
   vendors: (search) => request('finance.php', { params: { action: 'vendors', ...(search ? { search } : {}) } }),
+  vendorsFull: (search) => request('finance.php', { params: { action: 'vendors_full', ...(search ? { search } : {}) } }),
+  vendorSave: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'vendor_save' } }),
+  vendorDelete: (id) => request('finance.php', { method: 'DELETE', params: { action: 'vendor', id } }),
+  vendorStatement: (vendorName, dateFrom, dateTo) =>
+    request('finance.php', { params: { action: 'vendor_statement', vendor_name: vendorName, date_from: dateFrom, date_to: dateTo } }),
   expenseSummary: (params) => request('finance.php', { params: { action: 'expense_summary', ...params } }),
   // Budgets
   budgets: (year) => request('finance.php', { params: { action: 'budgets', year } }),
@@ -380,6 +385,7 @@ export const messaging = {
   send: (data) => request('messaging.php', { method: 'POST', body: data, params: { action: 'send' } }),
   delete: (id) => request('messaging.php', { method: 'DELETE', params: { id } }),
   config: () => request('messaging.php', { params: { action: 'config' } }),
+  consentStats: () => request('messaging.php', { params: { action: 'consent_stats' } }),
   saveConfig: (data) => request('messaging.php', { method: 'POST', body: data, params: { action: 'config' } }),
   testEmail: (email) => request('messaging.php', { method: 'POST', body: { email }, params: { action: 'test_email' } }),
 };
@@ -400,7 +406,7 @@ export const checkin = {
   codes: () => request('checkin.php', { params: { action: 'codes' } }),
   memberCode: (memberId) => request('checkin.php', { params: { action: 'member_code', member_id: memberId } }),
   generateCodes: (memberIds) => request('checkin.php', { method: 'POST', body: { member_ids: memberIds }, params: { action: 'generate_codes' } }),
-  regenerateCode: (memberId) => request('checkin.php', { method: 'POST', body: { member_id: memberId }, params: { action: 'regenerate_code' } }),
+  regenerateCode: (memberId, targets) => request('checkin.php', { method: 'POST', body: { member_id: memberId, targets }, params: { action: 'regenerate_code' } }),
   qrCheckin: (qrCode, serviceId) => request('checkin.php', { method: 'POST', body: { qr_code: qrCode, service_id: serviceId }, params: { action: 'qr_checkin' } }),
   pinCheckin: (pinCode, serviceId) => request('checkin.php', { method: 'POST', body: { pin_code: pinCode, service_id: serviceId }, params: { action: 'pin_checkin' } }),
   manualCheckin: (data) => request('checkin.php', { method: 'POST', body: data, params: { action: 'manual_checkin' } }),

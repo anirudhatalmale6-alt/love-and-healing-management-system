@@ -54,7 +54,7 @@ function CheckinKiosk() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showRegister, setShowRegister] = useState(false);
-  const [regForm, setRegForm] = useState({ first_name: '', last_name: '', phone: '', email: '' });
+  const [regForm, setRegForm] = useState({ first_name: '', last_name: '', phone: '', email: '', sms_consent: 0 });
   const [regPhoto, setRegPhoto] = useState(null);
   const [regLoading, setRegLoading] = useState(false);
   const [useCamera, setUseCamera] = useState(false);
@@ -118,7 +118,7 @@ function CheckinKiosk() {
         try { await members.uploadPhoto(newMemberId, regPhoto); } catch {}
       }
       setResult({ ...res, pin_code: res.pin_code });
-      setRegForm({ first_name: '', last_name: '', phone: '', email: '' });
+      setRegForm({ first_name: '', last_name: '', phone: '', email: '', sms_consent: 0 });
       setRegPhoto(null);
       setShowRegister(false);
     } catch (err) {
@@ -233,6 +233,24 @@ function CheckinKiosk() {
                 placeholder="email@example.com"
               />
             </div>
+            {/* First-party consent: the visitor ticks this themselves at the
+                kiosk. Must never be pre-ticked. */}
+            <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer ${regForm.sms_consent ? 'border-green-400 bg-green-50' : 'border-gray-200 bg-gray-50'}`}>
+              <input
+                type="checkbox"
+                className="mt-0.5 h-5 w-5 flex-shrink-0"
+                checked={!!regForm.sms_consent}
+                onChange={e => setRegForm(f => ({ ...f, sms_consent: e.target.checked ? 1 : 0 }))}
+              />
+              <span className="text-sm text-gray-700 leading-snug">
+                <span className="font-semibold text-gray-900">Yes, send me church text messages.</span>{' '}
+                I agree to receive recurring automated text messages (service reminders, event
+                announcements, prayer updates, and church news) from Love and Healing at the
+                number above. Consent is not a condition of membership. Up to 10 messages per month.
+                Message &amp; data rates may apply. Reply STOP to unsubscribe or HELP for help.
+              </span>
+            </label>
+
             <div className="pt-1">
               <PhotoCapture onChange={setRegPhoto} />
             </div>
@@ -340,7 +358,7 @@ function ManualCheckin() {
   const [todayLogs, setTodayLogs] = useState([]);
   const [message, setMessage] = useState('');
   const [showNewPerson, setShowNewPerson] = useState(false);
-  const [newPerson, setNewPerson] = useState({ first_name: '', last_name: '', phone: '', email: '' });
+  const [newPerson, setNewPerson] = useState({ first_name: '', last_name: '', phone: '', email: '', sms_consent: 0 });
   const [newPersonPhoto, setNewPersonPhoto] = useState(null);
   const [regLoading, setRegLoading] = useState(false);
 
@@ -402,7 +420,7 @@ function ManualCheckin() {
         try { await members.uploadPhoto(newMemberId, newPersonPhoto); } catch {}
       }
       setMessage(`${newPerson.first_name} ${newPerson.last_name} registered & checked in!`);
-      setNewPerson({ first_name: '', last_name: '', phone: '', email: '' });
+      setNewPerson({ first_name: '', last_name: '', phone: '', email: '', sms_consent: 0 });
       setNewPersonPhoto(null);
       setShowNewPerson(false);
       loadToday();
@@ -453,6 +471,24 @@ function ManualCheckin() {
             <input type="tel" placeholder="Phone Number *" className="input" required value={newPerson.phone} onChange={e => setNewPerson(p => ({ ...p, phone: e.target.value }))} />
             <input type="email" placeholder="Email (optional)" className="input" value={newPerson.email} onChange={e => setNewPerson(p => ({ ...p, email: e.target.value }))} />
           </div>
+          {/* The person is standing here and ticks this themselves - that is
+              valid consent. Never pre-tick it. */}
+          <label className={`mt-3 flex items-start gap-3 p-3 rounded-lg border cursor-pointer ${newPerson.sms_consent ? 'border-green-400 bg-white' : 'border-gray-200 bg-white'}`}>
+            <input
+              type="checkbox"
+              className="mt-0.5 h-5 w-5 flex-shrink-0"
+              checked={!!newPerson.sms_consent}
+              onChange={e => setNewPerson(p => ({ ...p, sms_consent: e.target.checked ? 1 : 0 }))}
+            />
+            <span className="text-sm text-gray-700 leading-snug">
+              <span className="font-semibold text-gray-900">Yes, send me church text messages.</span>{' '}
+              I agree to receive recurring automated text messages (service reminders, event
+              announcements, prayer updates, and church news) from Love and Healing at the
+              number above. Consent is not a condition of membership. Up to 10 messages per month.
+              Message &amp; data rates may apply. Reply STOP to unsubscribe or HELP for help.
+            </span>
+          </label>
+
           <div className="mt-3">
             <PhotoCapture onChange={setNewPersonPhoto} />
           </div>
@@ -823,6 +859,9 @@ function ManageCodes() {
   const [generating, setGenerating] = useState(false);
   const [search, setSearch] = useState('');
   const [message, setMessage] = useState('');
+  const [regenTarget, setRegenTarget] = useState(null);
+  const [regenOpts, setRegenOpts] = useState({ qr: true, barcode: true, pin: true });
+  const [regenBusy, setRegenBusy] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -848,8 +887,27 @@ function ManageCodes() {
     setGenerating(false);
   };
 
-  const handleRegenerate = async (memberId) => {
-    try { await checkin.regenerateCode(memberId); load(); } catch {}
+  const openRegen = (c) => {
+    setRegenOpts({ qr: true, barcode: true, pin: true });
+    setRegenTarget(c);
+  };
+
+  const doRegenerate = async () => {
+    if (!regenTarget) return;
+    const targets = Object.keys(regenOpts).filter(k => regenOpts[k]);
+    if (targets.length === 0) return;
+    setRegenBusy(true);
+    try {
+      await checkin.regenerateCode(regenTarget.member_id, targets);
+      setRegenTarget(null);
+      await load();
+      const labels = { qr: 'QR code', barcode: 'barcode', pin: 'PIN' };
+      setMessage(`Regenerated: ${targets.map(t => labels[t]).join(', ')}`);
+      setTimeout(() => setMessage(''), 3000);
+    } catch (err) {
+      setMessage(err.message || 'Failed to regenerate');
+    }
+    setRegenBusy(false);
   };
 
   const handleDelete = async (codeId) => {
@@ -919,11 +977,18 @@ function ManageCodes() {
                       <span className="font-mono text-lg font-bold tracking-wider text-primary-700">{c.pin_code}</span>
                     </td>
                     <td className="px-4 py-3">
-                      <span className="font-mono text-xs text-gray-500">{c.qr_code}</span>
+                      <div className="font-mono text-xs text-gray-500">
+                        <span className="text-gray-400">QR:</span> {c.qr_code}
+                      </div>
+                      {c.barcode_code && c.barcode_code !== c.qr_code && (
+                        <div className="font-mono text-xs text-gray-500">
+                          <span className="text-gray-400">Bar:</span> {c.barcode_code}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex gap-2">
-                        <button onClick={() => handleRegenerate(c.member_id)} className="text-blue-600 hover:text-blue-800" title="Regenerate">
+                        <button onClick={() => openRegen(c)} className="text-blue-600 hover:text-blue-800" title="Regenerate code">
                           <RefreshCw size={14} />
                         </button>
                         <button onClick={() => handleDelete(c.id)} className="text-red-400 hover:text-red-600" title="Delete">
@@ -938,6 +1003,60 @@ function ManageCodes() {
           </div>
         )}
       </div>
+
+      {regenTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={() => !regenBusy && setRegenTarget(null)}>
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b">
+              <h3 className="text-lg font-bold text-gray-900">Regenerate code</h3>
+              <button onClick={() => !regenBusy && setRegenTarget(null)} className="text-gray-400 hover:text-gray-600">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="px-5 py-4">
+              <p className="text-sm text-gray-600 mb-1">
+                {regenTarget.first_name} {regenTarget.last_name}
+              </p>
+              <p className="text-sm text-gray-500 mb-4">
+                Tick only what you want to change. Anything you leave unticked stays the same, so a card you've already printed keeps working for those parts.
+              </p>
+              <div className="space-y-2">
+                {[
+                  { key: 'qr', label: 'QR code', note: 'the square code on the card front' },
+                  { key: 'barcode', label: 'Barcode', note: 'the striped code on the card back' },
+                  { key: 'pin', label: 'PIN', note: 'the 4-digit number' },
+                ].map(opt => (
+                  <label key={opt.key} className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50">
+                    <input
+                      type="checkbox"
+                      checked={regenOpts[opt.key]}
+                      onChange={e => setRegenOpts(o => ({ ...o, [opt.key]: e.target.checked }))}
+                      className="mt-0.5 h-4 w-4"
+                    />
+                    <span>
+                      <span className="font-medium text-gray-800">{opt.label}</span>
+                      <span className="block text-xs text-gray-500">{opt.note}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mt-3">
+                The QR code and the barcode are two different codes now, so you can change one without touching the other.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-4 border-t">
+              <button onClick={() => setRegenTarget(null)} disabled={regenBusy} className="btn btn-secondary">Cancel</button>
+              <button
+                onClick={doRegenerate}
+                disabled={regenBusy || !Object.values(regenOpts).some(Boolean)}
+                className="btn btn-primary"
+              >
+                <RefreshCw size={14} /> {regenBusy ? 'Regenerating...' : 'Regenerate selected'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -990,6 +1109,10 @@ function PrintCards() {
   const [selected, setSelected] = useState(new Set());
   const [churchSettings, setChurchSettings] = useState({});
   const [cardPrinterMode, setCardPrinterMode] = useState(true);
+  const [cardOrientation, setCardOrientation] = useState('landscape');
+  // 'both' = front+back interleaved (dual-sided printers).
+  // 'front'/'back' = one pass each, so a single-sided printer can be flipped by hand.
+  const [cardSides, setCardSides] = useState('both');
   const printRef = useRef(null);
 
   useEffect(() => {
@@ -1168,6 +1291,11 @@ function PrintCards() {
 
     const logoSrcUrl = logoUrl.startsWith('http') ? logoUrl : window.location.origin + logoUrl;
     const headerSrcUrl = window.location.origin + '/system/uploads/assets/ID Card header.png';
+    // Single-line gold wordmark supplied by the pastor - used on the landscape front.
+    const headerWideUrl = window.location.origin + '/system/uploads/assets/ID Card header wide.png';
+    // Black version of the H mark - the light one ghosts out on the white back.
+    const backLogoUrl = window.location.origin + '/system/uploads/assets/ID Card back logo.png';
+    const cardTagline = 'A House of Love and Healing';
 
     const photoUrls = toPrint.map(c =>
       c.photo_url ? (c.photo_url.startsWith('http') ? c.photo_url : window.location.origin + c.photo_url) : ''
@@ -1179,20 +1307,25 @@ function PrintCards() {
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
 
+    // CR80 card geometry depends on the chosen orientation.
+    const isLandscape = cardOrientation === 'landscape';
+    const CARD_W = isLandscape ? '3.375in' : '2.125in';
+    const CARD_H = isLandscape ? '2.125in' : '3.375in';
+
     // Card-printer mode: one card side per page, sized to a CR80 card, no margins.
     // Suits direct-to-card printers such as the Magicard Enduro (dual-sided).
     const printModeCss = cardPrinterMode ? `
-    @page { size: 2.125in 3.375in; margin: 0; }
+    @page { size: ${CARD_W} ${CARD_H}; margin: 0; }
     body.card-printer { background: #fff; }
     body.card-printer .page { display: block; padding: 0; gap: 0; }
     body.card-printer .card-pair { display: block; }
     body.card-printer .card {
-      width: 2.125in; height: 3.375in;
+      width: ${CARD_W}; height: ${CARD_H};
       border-radius: 0; border: none; margin: 0;
       page-break-before: always; break-before: page;
       page-break-inside: avoid;
     }
-    body.card-printer .card-pair:first-child .front {
+    body.card-printer .card-pair:first-child .card:first-child {
       page-break-before: avoid; break-before: avoid;
     }
     @media print {
@@ -1200,12 +1333,12 @@ function PrintCards() {
       body.card-printer .card { border: none; }
     }
     ` : '';
-    const bodyClass = cardPrinterMode ? 'card-printer' : '';
+    const bodyClass = [cardPrinterMode ? 'card-printer' : '', isLandscape ? 'landscape' : ''].filter(Boolean).join(' ');
 
     const cardsHtml = toPrint.map((c, i) => {
       const canvas = document.createElement('canvas');
       try {
-        JsBarcode(canvas, c.qr_code, {
+        JsBarcode(canvas, c.barcode_code || c.qr_code, {
           format: 'CODE128', width: 1.5, height: 30, displayValue: false, margin: 0,
         });
       } catch { return ''; }
@@ -1219,8 +1352,29 @@ function PrintCards() {
         ? `<img src="${photoSrc}" class="photo" />`
         : `<div class="photo-placeholder">${(c.first_name?.[0] || '') + (c.last_name?.[0] || '')}</div>`;
 
-      return `
-        <div class="card-pair">
+      const frontHtml = isLandscape
+        ? `
+          <div class="card front">
+            <div class="front-header">
+              <img src="${headerWideUrl}" class="header-img" onerror="this.outerHTML='<div class=church-name-text>${churchName.toUpperCase()}</div>'" />
+            </div>
+            <div class="front-body">
+              <div class="front-photo-col">
+                ${photoHtml}
+              </div>
+              <div class="front-info-col">
+                <img src="${logoSrcUrl}" class="front-logo" onerror="this.style.display='none'" />
+                <div class="member-name">${c.first_name} ${c.last_name}</div>
+                ${title ? `<div class="member-title">${title}</div>` : ''}
+                ${expiryFormatted ? `<div class="expiry-date">EXP: ${expiryFormatted}</div>` : ''}
+                <div class="front-qr">
+                  <img src="${qrDataUrl}" class="qr-img-front" />
+                  <div class="qr-label">Scan to Check In</div>
+                </div>
+              </div>
+            </div>
+          </div>`
+        : `
           <div class="card front">
             <div class="front-header">
               <img src="${headerSrcUrl}" class="header-img" onerror="this.outerHTML='<div class=church-name-text>${churchName.toUpperCase()}</div>'" />
@@ -1236,22 +1390,32 @@ function PrintCards() {
               <img src="${qrDataUrl}" class="qr-img-front" />
               <div class="qr-label">Scan to Check In</div>
             </div>
-          </div>
+          </div>`;
+
+      const backHtml = `
           <div class="card back">
             <div class="back-header">
-              <img src="${logoSrcUrl}" class="back-logo" onerror="this.style.display='none'" />
-              <div class="back-church">${churchName.toUpperCase()}</div>
+              <img src="${backLogoUrl}" class="back-logo" onerror="this.style.display='none'" />
+              <div class="back-titles">
+                <div class="back-church">${churchName.toUpperCase()}</div>
+                <div class="back-tagline">${cardTagline}</div>
+              </div>
             </div>
             <div class="back-body">
               <div class="back-barcode">
                 <img src="${barcodeDataUrl}" class="barcode-img" />
-                <div class="barcode-text">${c.qr_code}</div>
+                <div class="barcode-text">${c.barcode_code || c.qr_code}</div>
               </div>
             </div>
             <div class="back-footer">
               ${churchAddress ? `<div class="back-addr">${churchAddress}</div>` : ''}
             </div>
-          </div>
+          </div>`;
+
+      return `
+        <div class="card-pair">
+          ${cardSides !== 'back' ? frontHtml : ''}
+          ${cardSides !== 'front' ? backHtml : ''}
         </div>
       `;
     }).join('');
@@ -1359,12 +1523,16 @@ function PrintCards() {
       width: 100%;
     }
     .back-logo {
-      width: 0.4in; height: 0.4in; border-radius: 50%;
-      object-fit: cover; display: block; margin: 0 auto 3px;
+      width: 0.4in; height: 0.4in;
+      object-fit: contain; display: block; margin: 0 auto 3px;
     }
     .back-church {
       font-size: 6.5pt; font-weight: 800; color: #1a1a2e;
       letter-spacing: 0.8px; line-height: 1.2;
+    }
+    .back-tagline {
+      font-size: 5.5pt; color: #5a5a6e; font-style: italic;
+      letter-spacing: 0.3px; line-height: 1.2; margin-top: 2px;
     }
     .back-body {
       flex: 1; display: flex; flex-direction: column;
@@ -1393,12 +1561,69 @@ function PrintCards() {
       .card { border: 1px solid #999; }
       @page { margin: 0.2in; }
     }
+    /* ===== LANDSCAPE (3.375in x 2.125in) ===== */
+    body.landscape .card {
+      width: 3.375in; height: 2.125in;
+      padding: 0.05in 0.06in;
+    }
+    /* FRONT: header strip on top, photo left, details + QR right */
+    body.landscape .front-header { padding: 3px 4px 3px; }
+    body.landscape .header-img { max-height: 0.34in; max-width: 94%; }
+    body.landscape .church-name-text { font-size: 7pt; }
+    body.landscape .front-body {
+      flex: 1; width: 100%;
+      display: flex; flex-direction: row; align-items: stretch;
+      gap: 0.09in; padding: 0.05in 0.03in 0.02in;
+      min-height: 0;
+    }
+    body.landscape .front-photo-col {
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    body.landscape .photo,
+    body.landscape .photo-placeholder {
+      width: 0.98in; height: 1.28in;
+    }
+    body.landscape .front-info-col {
+      flex: 1; min-width: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; text-align: center;
+    }
+    body.landscape .front-info-col .front-logo {
+      width: 0.3in; height: 0.3in; border-radius: 50%;
+      object-fit: cover; border: 1.5px solid rgba(232,212,77,0.5);
+      margin-bottom: 2px;
+    }
+    body.landscape .member-name { font-size: 11pt; margin-top: 0; }
+    body.landscape .member-title { font-size: 7pt; margin-top: 1px; }
+    body.landscape .expiry-date { font-size: 6pt; margin-top: 1px; }
+    body.landscape .front-qr {
+      margin-top: 4px; padding-top: 3px; width: 100%;
+      border-top: 1px solid rgba(255,255,255,0.15);
+    }
+    body.landscape .qr-img-front { width: 0.56in; height: 0.56in; }
+    body.landscape .qr-label { font-size: 5pt; margin-top: 1px; }
+    /* BACK: logo + church name on one line, big barcode, address footer */
+    body.landscape .back-header {
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 5px 6px;
+    }
+    body.landscape .back-logo {
+      width: 0.46in; height: 0.42in; margin: 0;
+    }
+    body.landscape .back-titles { text-align: left; }
+    body.landscape .back-church { font-size: 10pt; }
+    body.landscape .back-tagline { font-size: 8pt; margin-top: 2px; }
+    body.landscape .back-body { padding: 6px 8px; }
+    body.landscape .barcode-img { height: 0.5in; max-width: 94%; }
+    body.landscape .barcode-text { font-size: 8pt; margin-top: 5px; }
+    body.landscape .back-addr { font-size: 7pt; }
     ${printModeCss}
   </style>
 </head>
 <body class="${bodyClass}">
   <div class="toolbar">
-    <h2>ID Card Preview - ${toPrint.length} card${toPrint.length !== 1 ? 's' : ''} (front + back)${cardPrinterMode ? ' &middot; Card Printer mode' : ''}</h2>
+    <h2>ID Card Preview - ${toPrint.length} card${toPrint.length !== 1 ? 's' : ''} ${cardSides === 'both' ? '(front + back)' : cardSides === 'front' ? '(FRONTS only - pass 1)' : '(BACKS only - pass 2)'}${cardPrinterMode ? ' &middot; Card Printer mode' : ''}</h2>
     <button onclick="window.print()">Print Cards</button>
   </div>
   <div class="page">${cardsHtml}</div>
@@ -1444,7 +1669,7 @@ function PrintCards() {
             </button>
           </div>
         </div>
-        <div className="mt-3 pt-3 border-t border-gray-100">
+        <div className="mt-3 pt-3 border-t border-gray-100 flex flex-wrap items-center gap-x-6 gap-y-3">
           <label className="flex items-center gap-2 text-sm cursor-pointer">
             <input
               type="checkbox"
@@ -1454,6 +1679,39 @@ function PrintCards() {
             />
             <span className="font-medium text-gray-700">Card printer mode (Magicard Enduro / CR80 direct-to-card)</span>
           </label>
+          <div className="flex items-center gap-3 text-sm">
+            <span className="font-medium text-gray-700">Orientation:</span>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="radio"
+                name="cardOrientation"
+                checked={cardOrientation === 'landscape'}
+                onChange={() => setCardOrientation('landscape')}
+              />
+              <span>Landscape (horizontal)</span>
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="radio"
+                name="cardOrientation"
+                checked={cardOrientation === 'portrait'}
+                onChange={() => setCardOrientation('portrait')}
+              />
+              <span>Portrait (vertical)</span>
+            </label>
+          </div>
+          <div className="flex items-center gap-3 text-sm">
+            <span className="font-medium text-gray-700">Print sides:</span>
+            <select
+              value={cardSides}
+              onChange={e => setCardSides(e.target.value)}
+              className="input py-1 text-sm w-auto"
+            >
+              <option value="both">Both sides (dual-sided printer)</option>
+              <option value="front">Fronts only (pass 1)</option>
+              <option value="back">Backs only (pass 2)</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -1462,8 +1720,10 @@ function PrintCards() {
           <AlertCircle size={16} className="text-blue-600 mt-0.5 shrink-0" />
           <div className="text-sm text-blue-800">
             <p className="font-medium">ID Card Printing</p>
-            <p className="mt-1">Portrait CR80 cards (2.125" x 3.375") — the exact media the Magicard Enduro uses. Front: logo, photo, name, QR code. Back: barcode for scanning.</p>
-            <p className="mt-1"><b>Card printer mode ON:</b> each card prints as its own CR80 page (front = side 1, back = side 2) with no margins, so it feeds correctly into the Magicard Enduro. In the print dialog choose the Magicard printer, set paper size to CR-80, and enable double-sided printing.</p>
+            <p className="mt-1">CR80 cards — the exact media the Magicard Enduro uses. Choose Landscape (3.375" x 2.125") or Portrait (2.125" x 3.375"). Front: church header, photo, name, title, QR code. Back: barcode for scanning. Landscape is best for plain (non-perforated) cards.</p>
+            <p className="mt-1"><b>Card printer mode ON:</b> each card side prints as its own CR80 page with no margins, so it feeds correctly into the Magicard.</p>
+            <p className="mt-1"><b>Dual-sided printer (Enduro Duo):</b> leave "Print sides" on <b>Both sides</b>, then turn on duplex in the Magicard driver (Printing Preferences &rarr; Card &rarr; Print on both sides). The printer takes page 1 as the front and page 2 as the back.</p>
+            <p className="mt-1"><b>Single-sided printer (plain Enduro+):</b> it cannot flip the card itself, so print in two passes. Set "Print sides" to <b>Fronts only</b> and print. Then take the printed cards, flip them over, put them back in the feeder in the same order, set "Print sides" to <b>Backs only</b> and print again.</p>
             <p className="mt-1"><b>Card printer mode OFF:</b> cards are tiled on a normal sheet (Letter) for a regular printer to cut out by hand.</p>
           </div>
         </div>
@@ -1510,7 +1770,7 @@ function PrintCards() {
               )}
               <div className="flex-1 space-y-2">
                 <div className="bg-white rounded p-1.5 border flex justify-center">
-                  <BarcodeImg value={c.qr_code} height={28} />
+                  <BarcodeImg value={c.barcode_code || c.qr_code} height={28} />
                 </div>
                 <div className="bg-white rounded p-1.5 border flex justify-center">
                   <QRCodeImg value={c.qr_code} size={64} />
@@ -1541,7 +1801,7 @@ function PrintCards() {
             </div>
             <div className="flex gap-1.5">
               <button
-                onClick={(e) => { e.stopPropagation(); downloadBarcode(c.qr_code, `${c.first_name}-${c.last_name}`); }}
+                onClick={(e) => { e.stopPropagation(); downloadBarcode(c.barcode_code || c.qr_code, `${c.first_name}-${c.last_name}`); }}
                 className="flex-1 flex items-center justify-center gap-1 text-xs py-1.5 px-2 rounded bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors"
                 title="Download Barcode"
               >

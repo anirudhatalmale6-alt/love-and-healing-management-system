@@ -393,6 +393,55 @@ switch ($method) {
             jsonResponse(['error' => $error], 400);
         }
 
+        // Duplicate guard: if someone with the same name or the same phone number
+        // already exists, stop and warn the user (409) so they can decide. Sending
+        // force=1 (the "Register anyway" button) skips this and inserts.
+        if (empty($data['force'])) {
+            $fn = trim($data['first_name']);
+            $ln = trim($data['last_name']);
+            $phoneDigits = preg_replace('/\D+/', '', (string)($data['phone'] ?? ''));
+            $matches = [];
+
+            // Same full name (case-insensitive, trimmed)
+            $nameStmt = $db->prepare("
+                SELECT id, first_name, last_name, phone, email, person_type, status
+                FROM members
+                WHERE LOWER(TRIM(first_name)) = LOWER(?) AND LOWER(TRIM(last_name)) = LOWER(?)
+            ");
+            $nameStmt->execute([$fn, $ln]);
+            foreach ($nameStmt->fetchAll() as $r) {
+                $r['match'] = 'name';
+                $matches[$r['id']] = $r;
+            }
+
+            // Same phone number (compare digits only; ignore very short numbers)
+            if (strlen($phoneDigits) >= 7) {
+                $phoneStmt = $db->query("
+                    SELECT id, first_name, last_name, phone, email, person_type, status
+                    FROM members
+                    WHERE phone IS NOT NULL AND phone <> ''
+                ");
+                foreach ($phoneStmt->fetchAll() as $r) {
+                    if (preg_replace('/\D+/', '', (string)$r['phone']) === $phoneDigits) {
+                        if (isset($matches[$r['id']])) {
+                            $matches[$r['id']]['match'] = 'name+phone';
+                        } else {
+                            $r['match'] = 'phone';
+                            $matches[$r['id']] = $r;
+                        }
+                    }
+                }
+            }
+
+            if (!empty($matches)) {
+                jsonResponse([
+                    'error' => 'A person with the same name or phone number already exists.',
+                    'duplicate' => true,
+                    'matches' => array_values($matches),
+                ], 409);
+            }
+        }
+
         // Blank date/select boxes arrive as empty strings; store them as NULL so a
         // cleared birthday really is cleared instead of becoming 0000-00-00.
         foreach ([
@@ -440,6 +489,25 @@ switch ($method) {
 
         $newId = $db->lastInsertId();
 
+        // Consent isn't part of the INSERT column list, so stamp it here -
+        // otherwise ticking the box on a brand-new person would be dropped.
+        if (!empty($data['sms_consent'])) {
+            $db->prepare("
+                UPDATE members
+                SET sms_consent = 1,
+                    sms_consent_at = NOW(),
+                    sms_consent_source = ?,
+                    sms_consent_proof = ?,
+                    sms_consent_by = ?
+                WHERE id = ?
+            ")->execute([
+                $data['sms_consent_source'] ?? 'paper_form',
+                $data['sms_consent_proof'] ?? null,
+                $currentUser['user_id'],
+                $newId,
+            ]);
+        }
+
         if (array_key_exists('group_ids', $data) && is_array($data['group_ids'])) {
             syncMemberGroups($db, (int)$newId, $data['group_ids']);
         }
@@ -466,6 +534,42 @@ switch ($method) {
 
         $data = getRequestBody();
 
+        // SMS consent is not a plain field: turning it ON has to stamp WHEN it
+        // was given, HOW, and WHO recorded it, because that record is the proof
+        // the carriers can demand. Turning it off records the opt-out instead.
+        if (array_key_exists('sms_consent', $data)) {
+            $wants = !empty($data['sms_consent']) ? 1 : 0;
+            $had = (int)$db->query("SELECT sms_consent FROM members WHERE id = " . (int)$id)->fetchColumn();
+
+            if ($wants === 1 && $had === 0) {
+                $stmt = $db->prepare("
+                    UPDATE members
+                    SET sms_consent = 1,
+                        sms_consent_at = NOW(),
+                        sms_consent_source = ?,
+                        sms_consent_proof = ?,
+                        sms_consent_by = ?,
+                        sms_opted_out_at = NULL
+                    WHERE id = ?
+                ");
+                $stmt->execute([
+                    $data['sms_consent_source'] ?? 'paper_form',
+                    $data['sms_consent_proof'] ?? null,
+                    $currentUser['user_id'],
+                    $id,
+                ]);
+            } elseif ($wants === 0 && $had === 1) {
+                $db->prepare("
+                    UPDATE members
+                    SET sms_consent = 0, sms_opted_out_at = NOW()
+                    WHERE id = ?
+                ")->execute([$id]);
+            }
+            unset($data['sms_consent'], $data['sms_consent_source'], $data['sms_consent_proof']);
+            $consentTouched = true;
+        }
+
+        $consentTouched = $consentTouched ?? false;
         $fields = [];
         $params = [];
         $allowedFields = [
@@ -492,7 +596,7 @@ switch ($method) {
 
         $hasGroups = array_key_exists('group_ids', $data) && is_array($data['group_ids']);
 
-        if (empty($fields) && !$hasGroups) {
+        if (empty($fields) && !$hasGroups && !$consentTouched) {
             jsonResponse(['error' => 'No fields to update'], 400);
         }
 

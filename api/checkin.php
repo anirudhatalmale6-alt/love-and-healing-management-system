@@ -69,6 +69,36 @@ if ($method === 'POST' && $action === 'quick_register') {
     $stmt->execute([$firstName, $lastName, $phone, $email]);
     $newId = (int)$db->lastInsertId();
 
+    // The person is standing at the kiosk and ticks this box themselves, so it
+    // is first-party consent - the strongest kind. Record when and how, and
+    // write the same proof line the website sign-up writes.
+    if (!empty($data['sms_consent'])) {
+        $db->prepare("
+            UPDATE members
+            SET sms_consent = 1,
+                sms_consent_at = NOW(),
+                sms_consent_source = 'checkin_kiosk',
+                sms_consent_proof = ?
+            WHERE id = ?
+        ")->execute([$_SERVER['REMOTE_ADDR'] ?? '', $newId]);
+
+        $digits = preg_replace('/\D+/', '', $phone);
+        if (strlen($digits) === 11 && $digits[0] === '1') $digits = substr($digits, 1);
+        $row = [
+            gmdate('Y-m-d H:i:s') . ' UTC',
+            "$firstName $lastName",
+            (strlen($digits) === 10 ? '+1' . $digits : $phone),
+            $_SERVER['REMOTE_ADDR'] ?? '',
+            substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 200),
+            'check-in kiosk (new person registration)',
+        ];
+        @file_put_contents(
+            __DIR__ . '/../../../lh_sms_consent.csv',
+            '"' . implode('","', array_map(fn($v) => str_replace('"', '""', $v), $row)) . "\"\n",
+            FILE_APPEND | LOCK_EX
+        );
+    }
+
     $qrCode = strtoupper(bin2hex(random_bytes(8)));
     $attempts = 0;
     do {
@@ -78,8 +108,8 @@ if ($method === 'POST' && $action === 'quick_register') {
         $attempts++;
     } while ($pinCheck->fetch() && $attempts < 100);
 
-    $db->prepare("INSERT INTO member_checkin_codes (member_id, qr_code, pin_code) VALUES (?, ?, ?)")
-       ->execute([$newId, $qrCode, $pin]);
+    $db->prepare("INSERT INTO member_checkin_codes (member_id, qr_code, barcode_code, pin_code) VALUES (?, ?, ?, ?)")
+       ->execute([$newId, $qrCode, $qrCode, $pin]);
 
     $serviceId = $data['service_id'] ?? null;
     $db->prepare("INSERT INTO checkin_logs (member_id, service_id, check_in_time, checkin_method) VALUES (?, ?, NOW(), 'manual')")
@@ -107,13 +137,17 @@ if ($method === 'POST' && ($action === 'qr_checkin' || $action === 'pin_checkin'
         if (empty($data['qr_code'])) {
             jsonResponse(['error' => 'QR code required'], 400);
         }
+        // A scan can come from the QR (front) or the barcode (back). Since the
+        // two can now be regenerated independently they may differ, so match
+        // either. COALESCE keeps this working for rows migrated before the split.
+        $scanned = $data['qr_code'];
         $stmt = $db->prepare("
             SELECT c.member_id, m.first_name, m.last_name, m.photo_url
             FROM member_checkin_codes c
             JOIN members m ON m.id = c.member_id
-            WHERE c.qr_code = ?
+            WHERE c.qr_code = ? OR COALESCE(c.barcode_code, c.qr_code) = ?
         ");
-        $stmt->execute([$data['qr_code']]);
+        $stmt->execute([$scanned, $scanned]);
     } else {
         if (empty($data['pin_code'])) {
             jsonResponse(['error' => 'PIN code required'], 400);
@@ -356,8 +390,8 @@ switch ($method) {
                     $attempts++;
                 } while ($pinCheck->fetch() && $attempts < 100);
 
-                $stmt = $db->prepare("INSERT INTO member_checkin_codes (member_id, qr_code, pin_code) VALUES (?, ?, ?)");
-                $stmt->execute([$mid, $qrCode, $pin]);
+                $stmt = $db->prepare("INSERT INTO member_checkin_codes (member_id, qr_code, barcode_code, pin_code) VALUES (?, ?, ?, ?)");
+                $stmt->execute([$mid, $qrCode, $qrCode, $pin]);
                 $generated++;
             }
 
@@ -477,21 +511,76 @@ switch ($method) {
             $memberId = (int)($data['member_id'] ?? 0);
             if (!$memberId) jsonResponse(['error' => 'member_id required'], 400);
 
-            $qrCode = strtoupper(bin2hex(random_bytes(8)));
-            $attempts = 0;
-            do {
-                $pin = str_pad(random_int(1000, 9999), 4, '0', STR_PAD_LEFT);
-                $pinCheck = $db->prepare("SELECT id FROM member_checkin_codes WHERE pin_code = ? AND member_id != ?");
-                $pinCheck->execute([$pin, $memberId]);
-                $attempts++;
-            } while ($pinCheck->fetch() && $attempts < 100);
+            // The pastor picks which of the three tokens to regenerate so a card
+            // that's already printed can keep the parts that haven't changed.
+            // Default (no targets given) = regenerate everything, matching the
+            // old behaviour for any caller that hasn't been updated.
+            $targets = $data['targets'] ?? ['qr', 'barcode', 'pin'];
+            if (!is_array($targets)) $targets = [$targets];
+            $doQr      = in_array('qr', $targets, true);
+            $doBarcode = in_array('barcode', $targets, true);
+            $doPin     = in_array('pin', $targets, true);
+            if (!$doQr && !$doBarcode && !$doPin) {
+                jsonResponse(['error' => 'Choose at least one of QR code, barcode or PIN to regenerate'], 400);
+            }
 
-            $stmt = $db->prepare("
-                INSERT INTO member_checkin_codes (member_id, qr_code, pin_code) VALUES (?, ?, ?)
-                ON DUPLICATE KEY UPDATE qr_code = VALUES(qr_code), pin_code = VALUES(pin_code)
-            ");
-            $stmt->execute([$memberId, $qrCode, $pin]);
-            jsonResponse(['message' => 'Code regenerated', 'qr_code' => $qrCode, 'pin_code' => $pin]);
+            // Make sure a row exists (and backfill barcode_code for legacy rows).
+            $has = $db->prepare("SELECT id FROM member_checkin_codes WHERE member_id = ?");
+            $has->execute([$memberId]);
+            if (!$has->fetch()) {
+                $seedQr = strtoupper(bin2hex(random_bytes(8)));
+                $seedPin = str_pad(random_int(1000, 9999), 4, '0', STR_PAD_LEFT);
+                $db->prepare("INSERT INTO member_checkin_codes (member_id, qr_code, barcode_code, pin_code) VALUES (?, ?, ?, ?)")
+                   ->execute([$memberId, $seedQr, $seedQr, $seedPin]);
+            }
+            $db->prepare("UPDATE member_checkin_codes SET barcode_code = qr_code WHERE member_id = ? AND (barcode_code IS NULL OR barcode_code = '')")
+               ->execute([$memberId]);
+
+            $sets = [];
+            $params = [];
+
+            $uniqueHex = function ($column) use ($db, $memberId) {
+                $attempts = 0;
+                do {
+                    $val = strtoupper(bin2hex(random_bytes(8)));
+                    // Neither token may collide with any QR or barcode in use.
+                    $chk = $db->prepare("SELECT id FROM member_checkin_codes WHERE (qr_code = ? OR barcode_code = ?) AND member_id != ?");
+                    $chk->execute([$val, $val, $memberId]);
+                    $attempts++;
+                } while ($chk->fetch() && $attempts < 100);
+                return $val;
+            };
+
+            $newQr = $newBarcode = $newPin = null;
+            if ($doQr)      { $newQr = $uniqueHex('qr_code');           $sets[] = 'qr_code = ?';      $params[] = $newQr; }
+            if ($doBarcode) { $newBarcode = $uniqueHex('barcode_code'); $sets[] = 'barcode_code = ?'; $params[] = $newBarcode; }
+            if ($doPin) {
+                $attempts = 0;
+                do {
+                    $newPin = str_pad(random_int(1000, 9999), 4, '0', STR_PAD_LEFT);
+                    $pinCheck = $db->prepare("SELECT id FROM member_checkin_codes WHERE pin_code = ? AND member_id != ?");
+                    $pinCheck->execute([$newPin, $memberId]);
+                    $attempts++;
+                } while ($pinCheck->fetch() && $attempts < 100);
+                $sets[] = 'pin_code = ?';
+                $params[] = $newPin;
+            }
+
+            $params[] = $memberId;
+            $db->prepare("UPDATE member_checkin_codes SET " . implode(', ', $sets) . " WHERE member_id = ?")
+               ->execute($params);
+
+            // Return the full current row so the UI always shows the live values.
+            $cur = $db->prepare("SELECT qr_code, barcode_code, pin_code FROM member_checkin_codes WHERE member_id = ?");
+            $cur->execute([$memberId]);
+            $row = $cur->fetch();
+            jsonResponse([
+                'message'   => 'Code regenerated',
+                'qr_code'   => $row['qr_code'],
+                'barcode_code' => $row['barcode_code'],
+                'pin_code'  => $row['pin_code'],
+                'regenerated' => array_values(array_keys(array_filter(['qr' => $doQr, 'barcode' => $doBarcode, 'pin' => $doPin]))),
+            ]);
 
         } else {
             jsonResponse(['error' => 'Invalid action'], 400);

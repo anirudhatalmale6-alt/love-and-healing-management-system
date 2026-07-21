@@ -12,7 +12,7 @@ import {
   Download, FileText, Search, TrendingUp, PieChart,
   Calendar, CreditCard, Users, ChevronDown, ChevronUp,
   Printer, Settings, Tag, Eye, EyeOff, ShieldCheck, Receipt,
-  BarChart3, Wallet, BookOpen, ChevronRight, Landmark
+  BarChart3, Wallet, BookOpen, ChevronRight, Landmark, Store
 } from 'lucide-react';
 
 const paymentMethods = [
@@ -79,6 +79,148 @@ function generatePDF(title, headers, rows, filename, summaryLines) {
   doc.save(filename);
 }
 
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const genDate = () => new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+
+// Build a PDF from a selectable set of columns. Each column is
+// { key, label, value: (row) => string|number, align?: 'right' }.
+function exportColumnsPDF({ title, subtitle, columns, rows, filename, summaryLines }) {
+  const doc = new jsPDF(columns.length > 5 ? { orientation: 'landscape' } : {});
+  doc.setFontSize(16);
+  doc.text('Love and Healing', 14, 15);
+  doc.setFontSize(12);
+  doc.text(title, 14, 23);
+  doc.setFontSize(9);
+  doc.setTextColor(100);
+  doc.text(`${subtitle ? subtitle + '  |  ' : ''}Generated: ${genDate()}`, 14, 29);
+  doc.setTextColor(0);
+
+  let startY = 35;
+  if (summaryLines && summaryLines.length) {
+    doc.setFontSize(10);
+    summaryLines.forEach((line, i) => doc.text(line, 14, startY + i * 6));
+    startY += summaryLines.length * 6 + 4;
+  }
+
+  const columnStyles = {};
+  columns.forEach((c, i) => { if (c.align === 'right') columnStyles[i] = { halign: 'right' }; });
+
+  autoTable(doc, {
+    head: [columns.map(c => c.label)],
+    body: rows.map(r => columns.map(c => c.value(r))),
+    startY,
+    styles: { fontSize: 8, cellPadding: 2.5 },
+    headStyles: { fillColor: [51, 65, 85], textColor: 255 },
+    alternateRowStyles: { fillColor: [249, 250, 251] },
+    columnStyles,
+  });
+  doc.save(filename);
+}
+
+// Open a print-ready window for the same selectable columns.
+function printColumnsTable({ title, subtitle, columns, rows, summaryLines }) {
+  const head = columns.map(c => `<th style="text-align:${c.align || 'left'}">${escapeHtml(c.label)}</th>`).join('');
+  const body = rows.map(r =>
+    `<tr>${columns.map(c => `<td style="text-align:${c.align || 'left'}">${escapeHtml(c.value(r))}</td>`).join('')}</tr>`
+  ).join('');
+  const summary = (summaryLines || []).map(l => `<div class="sum">${escapeHtml(l)}</div>`).join('');
+  const win = window.open('', '_blank');
+  if (!win) { alert('Please allow pop-ups to print.'); return; }
+  win.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+    <style>
+      *{box-sizing:border-box}
+      body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:24px;}
+      h1{font-size:18px;margin:0}
+      h2{font-size:14px;margin:2px 0 2px;font-weight:600}
+      .meta{font-size:11px;color:#666;margin-bottom:12px}
+      .sum{font-size:12px;margin:2px 0}
+      table{width:100%;border-collapse:collapse;margin-top:10px;font-size:11px}
+      th,td{border:1px solid #d1d5db;padding:5px 7px}
+      thead th{background:#334155;color:#fff;text-align:left}
+      tbody tr:nth-child(even){background:#f9fafb}
+      @media print{body{margin:10mm}}
+    </style></head><body>
+    <h1>Love and Healing</h1>
+    <h2>${escapeHtml(title)}</h2>
+    <div class="meta">${subtitle ? escapeHtml(subtitle) + ' &middot; ' : ''}Generated: ${escapeHtml(genDate())}</div>
+    ${summary}
+    <table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
+    <script>window.onload=function(){setTimeout(function(){window.print();},250);};<\/script>
+    </body></html>`);
+  win.document.close();
+  win.focus();
+}
+
+/**
+ * PDF / Print controls with a column picker. Fetches ALL matching rows
+ * (not just the current page) via fetchRows() before exporting.
+ */
+function ExportControls({ title, subtitle, columns, defaultKeys, fetchRows, filenameBase, summaryFor, align = 'right' }) {
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState(() => new Set(defaultKeys || columns.map(c => c.key)));
+  const [busy, setBusy] = useState(false);
+
+  const toggle = (key) => setSelected(prev => {
+    const next = new Set(prev);
+    next.has(key) ? next.delete(key) : next.add(key);
+    return next;
+  });
+
+  const run = async (mode) => {
+    const chosen = columns.filter(c => selected.has(c.key));
+    if (chosen.length === 0) return;
+    setBusy(true);
+    try {
+      const rows = await fetchRows();
+      const summaryLines = summaryFor ? summaryFor(rows) : null;
+      const stamp = new Date().toISOString().split('T')[0];
+      if (mode === 'pdf') {
+        exportColumnsPDF({ title, subtitle, columns: chosen, rows, filename: `${filenameBase}-${stamp}.pdf`, summaryLines });
+      } else {
+        printColumnsTable({ title, subtitle, columns: chosen, rows, summaryLines });
+      }
+      setOpen(false);
+    } catch (e) {
+      alert(e.message || 'Export failed');
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="relative flex items-center gap-2">
+      <div className="relative">
+        <button type="button" onClick={() => setOpen(o => !o)} className="btn-secondary" title="Choose columns">
+          <Settings size={15} /> Columns <ChevronDown size={14} />
+        </button>
+        {open && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+            <div className={`absolute ${align === 'left' ? 'left-0' : 'right-0'} mt-1 z-20 bg-white border border-gray-200 rounded-lg shadow-lg p-2 w-56`}>
+              <div className="text-xs font-semibold text-gray-500 px-2 py-1">Show columns</div>
+              {columns.map(c => (
+                <label key={c.key} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer text-sm">
+                  <input type="checkbox" checked={selected.has(c.key)} onChange={() => toggle(c.key)} className="h-4 w-4" />
+                  <span>{c.label}</span>
+                </label>
+              ))}
+              {selected.size === 0 && <div className="text-xs text-red-500 px-2 py-1">Pick at least one column</div>}
+            </div>
+          </>
+        )}
+      </div>
+      <button type="button" onClick={() => run('pdf')} disabled={busy || selected.size === 0} className="btn-secondary" title="Download PDF">
+        <FileText size={15} /> {busy ? '...' : 'PDF'}
+      </button>
+      <button type="button" onClick={() => run('print')} disabled={busy || selected.size === 0} className="btn-secondary" title="Print">
+        <Printer size={15} /> Print
+      </button>
+    </div>
+  );
+}
+
 export default function FinancePage() {
   const { isAdmin, hasPermission, hasFinanceSection } = useAuth();
   const [tab, setTab] = useState(() => new URLSearchParams(window.location.search).get('tab') || 'record');
@@ -100,6 +242,7 @@ export default function FinancePage() {
     { key: 'financial_statements', label: 'Fin. Statements', icon: Wallet, show: hasReports && (hasFinanceSection('financial_statements') || hasFinanceSection('income_statement') || hasFinanceSection('balance_sheet') || hasFinanceSection('budget_actual')) },
     { key: 'pledges', label: 'Pledges', icon: Calendar, show: hasGiving && hasFinanceSection('pledges') },
     { key: 'accounts', label: 'Chart of Accounts', icon: BookOpen, show: hasFullFinance && hasFinanceSection('accounts') },
+    { key: 'vendors', label: 'Vendors', icon: Store, show: (hasExpenses || hasGiving) && hasFinanceSection('vendors') },
     { key: 'audit', label: 'Activity Log', icon: Eye, show: hasFullFinance && hasFinanceSection('audit') },
     ...(isAdmin ? [{ key: 'categories', label: 'Categories', icon: Tag, show: hasFinanceSection('categories') }] : []),
   ];
@@ -153,6 +296,7 @@ export default function FinancePage() {
       {tab === 'financial_statements' && <FinancialStatementsTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} hasFinanceSection={hasFinanceSection} />}
       {tab === 'pledges' && <PledgesTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
       {tab === 'accounts' && <ChartOfAccountsTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
+      {tab === 'vendors' && <VendorsTab setError={setError} setMessage={setMessage} />}
       {tab === 'audit' && <AuditLogTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
       {tab === 'categories' && isAdmin && <CategoriesTab setError={setError} setMessage={setMessage} />}
     </div>
@@ -203,8 +347,23 @@ function MemberTypeahead({ membersList, vendorList = [], value, donorName, onCha
   }, []);
 
   const handleAddNew = async () => {
-    if (!newName.trim()) return;
-    const parts = newName.trim().split(/\s+/);
+    const nm = newName.trim();
+    if (!nm) return;
+
+    // A vendor / business (e.g. "HC Store", "Amazon") is saved to the Vendors
+    // registry, NOT the People list, and attached to the record as a plain name.
+    if (newType === 'vendor') {
+      try { await financeApi.vendorSave({ name: nm }); } catch (err) { /* duplicate is fine, still use the name */ }
+      onChange('');
+      onDonorNameChange(nm);
+      setSearch(nm);
+      setShowAddNew(false);
+      setOpen(false);
+      if (onAddNew) onAddNew();
+      return;
+    }
+
+    const parts = nm.split(/\s+/);
     const firstName = parts[0] || '';
     const lastName = parts.slice(1).join(' ') || '';
     try {
@@ -257,19 +416,22 @@ function MemberTypeahead({ membersList, vendorList = [], value, donorName, onCha
       )}
       {showAddNew && (
         <div className="bg-white border border-gray-200 rounded-lg shadow-lg p-3">
-          <div className="text-sm font-medium text-gray-700 mb-2">Register New Person</div>
-          <input className="input py-1.5 text-sm mb-2" placeholder="Full name" value={newName} onChange={e => setNewName(e.target.value)} autoFocus />
+          <div className="text-sm font-medium text-gray-700 mb-2">{newType === 'vendor' ? 'Add New Vendor' : 'Register New'}</div>
+          <input className="input py-1.5 text-sm mb-2" placeholder={newType === 'vendor' ? 'Business / vendor name' : 'Full name'} value={newName} onChange={e => setNewName(e.target.value)} autoFocus />
           <select className="input py-1.5 text-sm mb-2" value={newType} onChange={e => setNewType(e.target.value)}>
-            <option value="church_member">Church Member</option>
-            <option value="non_member_attendee">Non-Member Attendee</option>
-            <option value="vendor">Vendor</option>
-            <option value="community">Community Contact</option>
-            <option value="companion">Companion</option>
-            <option value="other">Other</option>
+            <option value="church_member">Person - Church Member</option>
+            <option value="non_member_attendee">Person - Non-Member Attendee</option>
+            <option value="community">Person - Community Contact</option>
+            <option value="companion">Person - Companion</option>
+            <option value="other">Person - Other</option>
+            <option value="vendor">Vendor / Business (not a person)</option>
           </select>
+          {newType === 'vendor' && (
+            <div className="text-xs text-gray-500 mb-2">Saved to Vendors. Add phone, email, website and address later in the Vendors tab.</div>
+          )}
           <div className="flex justify-end gap-2">
-            <button type="button" className="btn-secondary py-1 px-2 text-xs" onClick={() => { setShowAddNew(false); onDonorNameChange(newName); onChange(''); }}>Use as Donor Name</button>
-            <button type="button" className="btn-primary py-1 px-2 text-xs" onClick={handleAddNew}><Plus size={12} /> Register & Select</button>
+            <button type="button" className="btn-secondary py-1 px-2 text-xs" onClick={() => { setShowAddNew(false); onDonorNameChange(newName); onChange(''); }}>Use name only</button>
+            <button type="button" className="btn-primary py-1 px-2 text-xs" onClick={handleAddNew}><Plus size={12} /> {newType === 'vendor' ? 'Add & Select' : 'Register & Select'}</button>
           </div>
         </div>
       )}
@@ -284,7 +446,15 @@ function MemberTypeahead({ membersList, vendorList = [], value, donorName, onCha
         className="input py-1.5 text-sm"
         placeholder="Search or type name..."
         value={open ? search : (value ? displayValue : (donorName || ''))}
-        onChange={e => { setSearch(e.target.value); updatePos(); setOpen(true); if (!e.target.value) { onChange(''); onDonorNameChange(''); } }}
+        onChange={e => {
+          const v = e.target.value;
+          setSearch(v); updatePos(); setOpen(true);
+          // Whatever is typed is kept as the name (a business like "HC Store",
+          // or a person you haven't picked yet) so it is never lost on Save.
+          // Choosing someone from the list below overrides this.
+          if (!v) { onChange(''); onDonorNameChange(''); }
+          else { onChange(''); onDonorNameChange(v); }
+        }}
         onFocus={() => { updatePos(); setOpen(true); setSearch(value ? displayValue : (donorName || '')); }}
       />
       {dropdown}
@@ -584,6 +754,7 @@ function RecordGivingTab({ setError, setMessage }) {
                     <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Category</th>
                     <th className="text-right px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Amount</th>
                     <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Method</th>
+                    <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Notes</th>
                     <th className="text-right px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Actions</th>
                   </tr>
                 </thead>
@@ -595,9 +766,10 @@ function RecordGivingTab({ setError, setMessage }) {
                       <td className="px-4 py-2"><span className="badge bg-blue-50 text-blue-700">{d.category_name}</span></td>
                       <td className="px-4 py-2 text-right text-sm font-semibold text-green-700">{formatCurrency(d.amount)}</td>
                       <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell capitalize">{paymentMethodLabel[d.payment_method] || d.payment_method}</td>
+                      <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell max-w-xs truncate" title={d.notes || ''}>{d.notes || '-'}</td>
                       <td className="px-4 py-2">
                         <div className="flex items-center justify-end gap-1">
-                          <button onClick={() => { setEditDonation(d); setEditForm({ amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
+                          <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
                           <button onClick={() => setDeleteId(d.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
                         </div>
                       </td>
@@ -618,7 +790,7 @@ function RecordGivingTab({ setError, setMessage }) {
                     <div className="text-right">
                       <div className="text-sm font-semibold text-green-700">{formatCurrency(d.amount)}</div>
                       <div className="flex items-center gap-1 mt-1 justify-end">
-                        <button onClick={() => { setEditDonation(d); setEditForm({ amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
+                        <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
                         <button onClick={() => setDeleteId(d.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
                       </div>
                     </div>
@@ -627,6 +799,7 @@ function RecordGivingTab({ setError, setMessage }) {
                     <span className="badge bg-blue-50 text-blue-700">{d.category_name}</span>
                     <span className="text-xs text-gray-400 capitalize">{paymentMethodLabel[d.payment_method] || d.payment_method}</span>
                   </div>
+                  {d.notes && <div className="text-xs text-gray-500 mt-1.5 italic">{d.notes}</div>}
                 </div>
               ))}
             </div>
@@ -637,10 +810,12 @@ function RecordGivingTab({ setError, setMessage }) {
 
       <Modal isOpen={!!editDonation} onClose={() => setEditDonation(null)} title="Edit Donation" size="sm">
         <div className="space-y-4">
+          <div><label className="label">Name</label><MemberTypeahead membersList={membersList} vendorList={vendorList} value={editForm.member_id || ''} donorName={editForm.donor_name || ''} onChange={val => setEditForm(f => ({ ...f, member_id: val, donor_name: val ? '' : f.donor_name }))} onDonorNameChange={val => setEditForm(f => ({ ...f, donor_name: val, member_id: '' }))} onAddNew={() => { membersApi.list({ limit: 9999, sort: 'last_name' }).then(d => setMembersList(d.members || [])); financeApi.vendors().then(d => setVendorList(d.vendors || [])).catch(() => {}); }} /></div>
           <div><label className="label">Amount ($)</label><input type="number" step="0.01" className="input" value={editForm.amount || ''} onChange={e => setEditForm(f => ({ ...f, amount: e.target.value }))} /></div>
           <div><label className="label">Category</label><select className="input" value={editForm.category_id || ''} onChange={e => setEditForm(f => ({ ...f, category_id: e.target.value }))}>{categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <div><label className="label">Method</label><select className="input" value={editForm.payment_method || 'cash'} onChange={e => setEditForm(f => ({ ...f, payment_method: e.target.value }))}>{paymentMethods.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}</select></div>
           <div><label className="label">Date</label><input type="date" className="input" value={editForm.donation_date || ''} onChange={e => setEditForm(f => ({ ...f, donation_date: e.target.value }))} /></div>
+          <div><label className="label">Notes</label><input className="input" placeholder="Notes" value={editForm.notes || ''} onChange={e => setEditForm(f => ({ ...f, notes: e.target.value }))} /></div>
           <div className="flex justify-end gap-3 pt-2">
             <button onClick={() => setEditDonation(null)} className="btn-secondary">Cancel</button>
             <button onClick={async () => { setEditSaving(true); try { await financeApi.update(editDonation.id, editForm); setEditDonation(null); setMessage('Updated'); loadDonations(); } catch(err) { setError(err.message); } setEditSaving(false); }} disabled={editSaving} className="btn-primary"><Check size={16} /> Save</button>
@@ -1287,6 +1462,8 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
   const [deleteItem, setDeleteItem] = useState(null);
   const [categories, setCategories] = useState([]);
   const [expCategories, setExpCategories] = useState([]);
+  const [showCols, setShowCols] = useState({ type: true, description: true, method: true, account: true, status: true, by: true });
+  const toggleCol = (col) => setShowCols(prev => ({ ...prev, [col]: !prev[col] }));
 
   useEffect(() => {
     financeApi.categories().then(d => setCategories(d.categories || []));
@@ -1391,9 +1568,67 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
     'Loan Payment': 'bg-amber-100 text-amber-700',
   };
 
+  const historyColumns = [
+    { key: 'date', label: 'Date', value: e => formatDate(e.date) },
+    { key: 'type', label: 'Type', value: e => e.type || '' },
+    { key: 'description', label: 'Description', value: e => e.description || '' },
+    { key: 'amount', label: 'Amount', align: 'right', value: e => formatCurrency(e.amount) },
+    { key: 'method', label: 'Method', value: e => paymentMethodLabel[e.method] || e.method || '-' },
+    { key: 'account', label: 'Account', value: e => e.account || '-' },
+    { key: 'status', label: 'Status', value: e => e.source === 'expense' ? (e.status === 'approved' ? 'Approved' : 'Pending') : '-' },
+    { key: 'recorded_by', label: 'Recorded by', value: e => e.recorded_by || '-' },
+  ];
+
+  const fetchAllHistory = async () => {
+    const params = { all: 1 };
+    if (typeFilter) params.type = typeFilter;
+    if (searchFilter) params.search = searchFilter;
+    if (dateFrom) params.date_from = dateFrom;
+    if (dateTo) params.date_to = dateTo;
+    const data = await financeApi.allTransactions(params);
+    return data.entries || [];
+  };
+
+  const historySummary = (rows) => {
+    const inc = rows.filter(r => r.type === 'Income').reduce((s, r) => s + Number(r.amount || 0), 0);
+    const exp = rows.filter(r => r.type === 'Expense').reduce((s, r) => s + Number(r.amount || 0), 0);
+    return [
+      `${rows.length} transaction(s)`,
+      `Total Income: ${formatCurrency(inc)}    Total Expenses: ${formatCurrency(exp)}    Net: ${formatCurrency(inc - exp)}`,
+    ];
+  };
+
+  const historySubtitle = (dateFrom || dateTo) ? `${dateFrom || 'start'} to ${dateTo || 'today'}` : 'All dates';
+
   return (
     <>
-      <h2 className="text-lg font-semibold text-gray-900 mb-4">All Transactions</h2>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="text-lg font-semibold text-gray-900">All Transactions</h2>
+        <ExportControls
+          title="Finance - History"
+          subtitle={historySubtitle}
+          columns={historyColumns}
+          fetchRows={fetchAllHistory}
+          filenameBase="finance-history"
+          summaryFor={historySummary}
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <span className="text-xs font-medium text-gray-500">Show/Hide:</span>
+        {[{ key: 'type', label: 'Type' }, { key: 'description', label: 'Description' }, { key: 'method', label: 'Method' }, { key: 'account', label: 'Account' }, { key: 'status', label: 'Status' }, { key: 'by', label: 'By' }].map(c => (
+          <button
+            key={c.key}
+            onClick={() => toggleCol(c.key)}
+            className={`text-xs px-2.5 py-1 rounded-full font-medium transition-colors ${
+              showCols[c.key] ? 'bg-primary-100 text-primary-700' : 'bg-gray-100 text-gray-400'
+            }`}
+          >
+            {showCols[c.key] ? <Eye size={12} className="inline mr-1" /> : <EyeOff size={12} className="inline mr-1" />}
+            {c.label}
+          </button>
+        ))}
+      </div>
 
       <div className="card mb-4">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
@@ -1434,12 +1669,13 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
                     <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Date</th>
-                    <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Type</th>
-                    <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Description</th>
+                    {showCols.type && <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Type</th>}
+                    {showCols.description && <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Description</th>}
                     <th className="text-right px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Amount</th>
-                    <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Method</th>
-                    <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Account</th>
-                    <th className="text-center px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Status</th>
+                    {showCols.method && <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Method</th>}
+                    {showCols.account && <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Account</th>}
+                    {showCols.status && <th className="text-center px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Status</th>}
+                    {showCols.by && <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Recorded by</th>}
                     <th className="text-right px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Actions</th>
                   </tr>
                 </thead>
@@ -1447,18 +1683,19 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
                   {entries.map(e => (
                     <tr key={`${e.source}-${e.id}`} className="hover:bg-gray-50">
                       <td className="px-4 py-2 text-sm text-gray-600">{formatDate(e.date)}</td>
-                      <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${typeColors[e.type]}`}>{e.type}</span></td>
-                      <td className="px-4 py-2 text-sm text-gray-700 max-w-[250px] truncate">{e.description}</td>
+                      {showCols.type && <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${typeColors[e.type]}`}>{e.type}</span></td>}
+                      {showCols.description && <td className="px-4 py-2 text-sm text-gray-700 max-w-[250px] truncate">{e.description}</td>}
                       <td className={`px-4 py-2 text-sm text-right font-semibold ${e.type === 'Income' ? 'text-green-700' : e.type === 'Expense' ? 'text-red-700' : 'text-blue-700'}`}>{formatCurrency(e.amount)}</td>
-                      <td className="px-4 py-2 text-sm text-gray-500 hidden md:table-cell capitalize">{paymentMethodLabel[e.method] || e.method || '-'}</td>
-                      <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell">{e.account || '-'}</td>
-                      <td className="px-4 py-2 text-center">
+                      {showCols.method && <td className="px-4 py-2 text-sm text-gray-500 hidden md:table-cell capitalize">{paymentMethodLabel[e.method] || e.method || '-'}</td>}
+                      {showCols.account && <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell">{e.account || '-'}</td>}
+                      {showCols.status && <td className="px-4 py-2 text-center">
                         {e.source === 'expense' ? (
                           <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${e.status === 'approved' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
                             {e.status === 'approved' ? 'Approved' : 'Pending'}
                           </span>
                         ) : <span className="text-xs text-gray-400">-</span>}
-                      </td>
+                      </td>}
+                      {showCols.by && <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell">{e.recorded_by || '-'}</td>}
                       <td className="px-4 py-2">
                         <div className="flex items-center justify-end gap-1">
                           {isAdmin && e.source === 'expense' && e.status !== 'approved' && (
@@ -1838,8 +2075,10 @@ function StatementsTab({ setError }) {
   const [mode, setMode] = useState('individual');
   const [membersList, setMembersList] = useState([]);
   const [donorsList, setDonorsList] = useState([]);
+  const [vendorsList, setVendorsList] = useState([]);
   const [selectedMemberId, setSelectedMemberId] = useState('');
   const [selectedDonorName, setSelectedDonorName] = useState('');
+  const [selectedVendor, setSelectedVendor] = useState('');
   const [categories, setCategories] = useState([]);
   const [catIds, setCatIds] = useState([]); // empty = all categories
   const [dateFrom, setDateFrom] = useState(new Date().getFullYear() + '-01-01');
@@ -1847,6 +2086,7 @@ function StatementsTab({ setError }) {
   const [statement, setStatement] = useState(null);
   const [allStatement, setAllStatement] = useState(null);
   const [nonGivers, setNonGivers] = useState(null);
+  const [vendorStatement, setVendorStatement] = useState(null);
   const [loading, setLoading] = useState(false);
   const [sortBy, setSortBy] = useState('name');
   const [includePledges, setIncludePledges] = useState(false);
@@ -1860,6 +2100,7 @@ function StatementsTab({ setError }) {
   useEffect(() => {
     membersApi.list({ limit: 9999, sort: 'last_name' }).then(d => setMembersList(d.members || []));
     financeApi.statementDonors().then(d => setDonorsList(d.donors || [])).catch(() => {});
+    financeApi.vendors().then(d => setVendorsList(d.vendors || [])).catch(() => {});
     financeApi.categories().then(d => setCategories((d.categories || []).filter(c => c.is_active == null || Number(c.is_active) === 1))).catch(() => {});
   }, []);
 
@@ -1886,6 +2127,17 @@ function StatementsTab({ setError }) {
       try {
         const data = await financeApi.nonGivers(dateFrom, dateTo, catParam);
         setNonGivers(data);
+      } catch (err) {
+        setError(err.message);
+      }
+      setLoading(false);
+    } else if (mode === 'vendor') {
+      if (!selectedVendor.trim()) { setError('Please select or type a vendor name'); return; }
+      setLoading(true);
+      setError('');
+      try {
+        const data = await financeApi.vendorStatement(selectedVendor.trim(), dateFrom, dateTo);
+        setVendorStatement(data);
       } catch (err) {
         setError(err.message);
       }
@@ -2063,27 +2315,101 @@ function StatementsTab({ setError }) {
     );
   };
 
+  const printVendorStatement = () => {
+    if (!vendorStatement) return;
+    const v = vendorStatement.vendor || {};
+    const contact = [
+      v.category ? `Category: ${v.category}` : '',
+      v.phone ? `Tel: ${v.phone}` : '',
+      v.email ? `Email: ${v.email}` : '',
+      v.website ? `Website: ${v.website}` : '',
+      v.address ? `Address: ${v.address}` : '',
+    ].filter(Boolean);
+
+    const purchaseRows = (vendorStatement.purchases || []).map(p => {
+      const date = new Date(p.expense_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `<tr>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${date}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${p.category_name || '-'}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${p.description || ''}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${p.payment_method || ''}${p.reference_number ? ' / ' + p.reference_number : ''}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;text-align:right;">${formatCurrency(p.amount)}</td>
+      </tr>`;
+    }).join('');
+
+    const incomeRows = (vendorStatement.income || []).map(d => {
+      const date = new Date(d.donation_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `<tr>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${date}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${d.category_name || '-'}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${d.notes || ''}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${d.payment_method || ''}${d.reference_number ? ' / ' + d.reference_number : ''}</td>
+        <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;text-align:right;">${formatCurrency(d.amount)}</td>
+      </tr>`;
+    }).join('');
+
+    const purchaseSection = (vendorStatement.purchases || []).length > 0 ? `
+      <h3 style="margin-top:24px;font-size:16px;">Purchases / Payments</h3>
+      <table><thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Method / Ref</th><th style="text-align:right;">Amount</th></tr></thead>
+      <tbody>${purchaseRows}
+      <tr style="border-top:2px solid #1f2937;"><td style="padding:8px 10px;font-weight:700;" colspan="4">Total Paid</td><td style="padding:8px 10px;text-align:right;font-weight:700;">${formatCurrency(vendorStatement.total_paid)}</td></tr>
+      </tbody></table>` : '<p style="margin-top:24px;font-size:14px;color:#6b7280;">No purchases recorded for this period.</p>';
+
+    const incomeSection = (vendorStatement.income || []).length > 0 ? `
+      <h3 style="margin-top:24px;font-size:16px;">Income Received</h3>
+      <table><thead><tr><th>Date</th><th>Category</th><th>Notes</th><th>Method / Ref</th><th style="text-align:right;">Amount</th></tr></thead>
+      <tbody>${incomeRows}
+      <tr style="border-top:2px solid #1f2937;"><td style="padding:8px 10px;font-weight:700;" colspan="4">Total Received</td><td style="padding:8px 10px;text-align:right;font-weight:700;">${formatCurrency(vendorStatement.total_received)}</td></tr>
+      </tbody></table>` : '';
+
+    const html = `<!DOCTYPE html><html><head><title>Vendor Statement - ${v.name || selectedVendor}</title>
+    <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:40px;color:#1f2937;max-width:820px;margin:0 auto;}
+    h1{font-size:22px;margin-bottom:4px;} .meta{color:#6b7280;font-size:14px;margin-bottom:20px;}
+    table{width:100%;border-collapse:collapse;font-size:14px;} th{text-align:left;padding:8px 10px;background:#f9fafb;border-bottom:2px solid #e5e7eb;font-weight:600;font-size:12px;text-transform:uppercase;color:#6b7280;}
+    @media print{body{padding:20px;}}</style></head>
+    <body>
+    <h1>Vendor Statement</h1>
+    <div class="meta">
+      <div><strong>Vendor:</strong> ${v.name || selectedVendor}</div>
+      ${contact.map(c => `<div>${c}</div>`).join('')}
+      <div><strong>Period:</strong> ${new Date(dateFrom + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} - ${new Date(dateTo + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</div>
+      <div><strong>Church:</strong> Love and Healing</div>
+    </div>
+    ${purchaseSection}
+    ${incomeSection}
+    <p style="margin-top:30px;font-size:12px;color:#9ca3af;">Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}.</p>
+    </body></html>`;
+    const win = window.open('', '_blank');
+    if (win) { win.document.write(html); win.document.close(); win.focus(); setTimeout(() => win.print(), 300); }
+  };
+
   return (
     <>
       <div className="card mb-6">
         <div className="flex gap-2 mb-4">
           <button
-            onClick={() => { setMode('individual'); setAllStatement(null); setNonGivers(null); }}
+            onClick={() => { setMode('individual'); setAllStatement(null); setNonGivers(null); setVendorStatement(null); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'individual' ? 'bg-primary-700 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
           >
             Individual Member
           </button>
           <button
-            onClick={() => { setMode('all'); setStatement(null); setNonGivers(null); }}
+            onClick={() => { setMode('all'); setStatement(null); setNonGivers(null); setVendorStatement(null); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'all' ? 'bg-primary-700 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
           >
             All Givers
           </button>
           <button
-            onClick={() => { setMode('non_givers'); setStatement(null); setAllStatement(null); }}
+            onClick={() => { setMode('non_givers'); setStatement(null); setAllStatement(null); setVendorStatement(null); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'non_givers' ? 'bg-red-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
           >
             Non-Givers
+          </button>
+          <button
+            onClick={() => { setMode('vendor'); setStatement(null); setAllStatement(null); setNonGivers(null); }}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'vendor' ? 'bg-primary-700 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+          >
+            Vendor
           </button>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
@@ -2111,6 +2437,21 @@ function StatementsTab({ setError }) {
               </select>
             </div>
           )}
+          {mode === 'vendor' && (
+            <div className="sm:col-span-2">
+              <label className="label">Select or Type Vendor</label>
+              <input
+                className="input"
+                list="vendor-statement-list"
+                value={selectedVendor}
+                onChange={e => setSelectedVendor(e.target.value)}
+                placeholder="e.g. Amazon, HC Store..."
+              />
+              <datalist id="vendor-statement-list">
+                {vendorsList.map((name, i) => <option key={i} value={name} />)}
+              </datalist>
+            </div>
+          )}
           {mode === 'non_givers' && <div className="sm:col-span-2" />}
           <div>
             <label className="label">From</label>
@@ -2122,6 +2463,7 @@ function StatementsTab({ setError }) {
           </div>
         </div>
 
+        {mode !== 'vendor' && (
         <div className="mt-4">
           <label className="label">Filter by Account / Category</label>
           <div className="flex flex-wrap gap-2">
@@ -2141,6 +2483,7 @@ function StatementsTab({ setError }) {
           </div>
           <p className="text-xs text-gray-400 mt-1">Leave on "All Categories" to include every account, or tap one or more (Tithe, Offering, Special Seed…) to narrow the statement. Applies to individual, all givers, and non-givers.</p>
         </div>
+        )}
 
         {mode === 'individual' && !selectedDonorName && (
           <label className="mt-4 flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
@@ -2393,10 +2736,112 @@ function StatementsTab({ setError }) {
         </div>
       )}
 
-      {!statement && !allStatement && !nonGivers && !loading && (
+      {/* Vendor Statement */}
+      {mode === 'vendor' && vendorStatement && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-lg font-bold text-gray-900">
+                {vendorStatement.vendor?.name || selectedVendor}
+                {!vendorStatement.vendor?.registered && <span className="ml-2 inline-block px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 text-[10px] font-medium uppercase tracking-wide align-middle">not registered</span>}
+              </h2>
+              <p className="text-sm text-gray-500">
+                Vendor statement | {new Date(dateFrom + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })} - {new Date(dateTo + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+              </p>
+              {vendorStatement.vendor?.registered && (
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {[vendorStatement.vendor.category, vendorStatement.vendor.phone, vendorStatement.vendor.email, vendorStatement.vendor.website].filter(Boolean).join(' · ')}
+                </p>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={printVendorStatement} className="btn-secondary">
+                <Printer size={16} /> Print
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-6">
+            <div className="bg-red-50 rounded-lg p-3">
+              <div className="text-xs text-red-600 font-medium">Total Paid</div>
+              <div className="text-lg font-bold text-red-700">{formatCurrency(vendorStatement.total_paid)}</div>
+            </div>
+            <div className="bg-green-50 rounded-lg p-3">
+              <div className="text-xs text-green-600 font-medium">Total Received</div>
+              <div className="text-lg font-bold text-green-700">{formatCurrency(vendorStatement.total_received)}</div>
+            </div>
+            <div className="bg-gray-50 rounded-lg p-3">
+              <div className="text-xs text-gray-500 font-medium">Net (received - paid)</div>
+              <div className={`text-lg font-bold ${vendorStatement.net < 0 ? 'text-red-700' : 'text-gray-900'}`}>{formatCurrency(vendorStatement.net)}</div>
+            </div>
+          </div>
+
+          <h3 className="text-sm font-semibold text-gray-700 mb-2">Purchases / Payments</h3>
+          {(vendorStatement.purchases || []).length > 0 ? (
+            <div className="overflow-x-auto mb-6">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Date</th>
+                    <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Category</th>
+                    <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Description</th>
+                    <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Method</th>
+                    <th className="text-right px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Amount</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {vendorStatement.purchases.map((p, i) => (
+                    <tr key={i} className="hover:bg-gray-50">
+                      <td className="px-3 py-2">{new Date(p.expense_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</td>
+                      <td className="px-3 py-2">{p.category_name || '-'}</td>
+                      <td className="px-3 py-2 hidden md:table-cell text-gray-600">{p.description || ''}</td>
+                      <td className="px-3 py-2 hidden md:table-cell capitalize">{p.payment_method || ''}</td>
+                      <td className="px-3 py-2 text-right font-medium text-red-700">{formatCurrency(p.amount)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-center text-gray-500 py-6 mb-4">No purchases recorded for this period</p>
+          )}
+
+          {(vendorStatement.income || []).length > 0 && (
+            <>
+              <h3 className="text-sm font-semibold text-gray-700 mb-2">Income Received</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 border-b border-gray-200">
+                    <tr>
+                      <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Date</th>
+                      <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Category</th>
+                      <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Notes</th>
+                      <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Method</th>
+                      <th className="text-right px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {vendorStatement.income.map((d, i) => (
+                      <tr key={i} className="hover:bg-gray-50">
+                        <td className="px-3 py-2">{new Date(d.donation_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</td>
+                        <td className="px-3 py-2">{d.category_name || '-'}</td>
+                        <td className="px-3 py-2 hidden md:table-cell text-gray-600">{d.notes || ''}</td>
+                        <td className="px-3 py-2 hidden md:table-cell capitalize">{d.payment_method || ''}</td>
+                        <td className="px-3 py-2 text-right font-medium text-green-700">{formatCurrency(d.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!statement && !allStatement && !nonGivers && !vendorStatement && !loading && (
         <div className="card text-center py-16">
           <FileText size={48} className="text-gray-300 mx-auto mb-3" />
-          <p className="text-gray-500">{mode === 'individual' ? 'Select a member or non-member donor and a date range to generate a giving statement' : mode === 'non_givers' ? 'Select a date range and click Generate Statement to see who did not give' : 'Select a date range and click Generate Statement to see all givers (members and non-members)'}</p>
+          <p className="text-gray-500">{mode === 'individual' ? 'Select a member or non-member donor and a date range to generate a giving statement' : mode === 'non_givers' ? 'Select a date range and click Generate Statement to see who did not give' : mode === 'vendor' ? 'Select or type a vendor and a date range to see everything paid to and received from that business' : 'Select a date range and click Generate Statement to see all givers (members and non-members)'}</p>
         </div>
       )}
     </>
@@ -3184,6 +3629,31 @@ function FinancialStatementsTab({ setError, setMessage, isAdmin, hasFinanceSecti
     doc.save(`balance-sheet-${data.date_from}-to-${data.date_to}.pdf`);
   };
 
+  // --- General Journal: selectable-column PDF / Print export ---
+  const journalColumns = [
+    { key: 'date', label: 'Date', value: e => formatDate(e.date) },
+    { key: 'type', label: 'Type', value: e => e.type || '' },
+    { key: 'description', label: 'Description', value: e => e.description || '' },
+    { key: 'debit', label: 'Debit', align: 'right', value: e => Number(e.debit) ? formatCurrency(e.debit) : '' },
+    { key: 'credit', label: 'Credit', align: 'right', value: e => Number(e.credit) ? formatCurrency(e.credit) : '' },
+    { key: 'method', label: 'Method', value: e => paymentMethodLabel[e.method] || e.method || '-' },
+    { key: 'recorded_by', label: 'Recorded by', value: e => e.recorded_by || '-' },
+  ];
+
+  const fetchAllJournal = async () => {
+    const res = await financeApi.journal({ date_from: dateFrom, date_to: dateTo, all: 1 });
+    return res.entries || [];
+  };
+
+  const journalSummary = (rows) => {
+    const debit = rows.reduce((s, r) => s + Number(r.debit || 0), 0);
+    const credit = rows.reduce((s, r) => s + Number(r.credit || 0), 0);
+    return [
+      `${rows.length} line(s)`,
+      `Total Debit: ${formatCurrency(debit)}    Total Credit: ${formatCurrency(credit)}`,
+    ];
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16">
@@ -3257,13 +3727,22 @@ function FinancialStatementsTab({ setError, setMessage, isAdmin, hasFinanceSecti
       {view === 'budget_actual' && data && <BudgetActualView data={data} />}
       {view === 'journal' && data && (
         <>
-          {isAdmin && (
-            <div className="flex justify-end mb-4">
+          <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
+            <ExportControls
+              title="Finance Statement - General Journal"
+              subtitle={`${data.date_from || 'start'} to ${data.date_to || 'today'}`}
+              columns={journalColumns}
+              fetchRows={fetchAllJournal}
+              filenameBase="general-journal"
+              summaryFor={journalSummary}
+              align="left"
+            />
+            {isAdmin && (
               <button onClick={() => setShowNewJournal(true)} className="btn-primary">
                 <Plus size={16} /> New Journal Entry
               </button>
-            </div>
-          )}
+            )}
+          </div>
           <GeneralJournalView data={data} page={journalPage} setPage={setJournalPage} isAdmin={isAdmin}
             onEdit={(entry) => {
               setJournalEdit(entry);
@@ -4448,6 +4927,147 @@ function PledgesTab({ setError, setMessage, isAdmin }) {
         )}
       </Modal>
     </>
+  );
+}
+
+/* ─── Vendors Tab ─── */
+const emptyVendor = { id: null, name: '', category: '', phone: '', email: '', website: '', address: '', notes: '', is_active: 1 };
+
+function VendorsTab({ setError, setMessage }) {
+  const [vendors, setVendors] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState(emptyVendor);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await financeApi.vendorsFull(search.trim() || undefined);
+      setVendors(d.vendors || []);
+      if (d.needs_migration) setError('Vendors table is not set up yet on the server.');
+    } catch (err) {
+      setError(err.message || 'Failed to load vendors');
+    } finally { setLoading(false); }
+  }, [search, setError]);
+
+  useEffect(() => { const t = setTimeout(load, 250); return () => clearTimeout(t); }, [load]);
+
+  const openNew = () => { setForm(emptyVendor); setShowForm(true); };
+  const openEdit = (v) => { setForm({ ...emptyVendor, ...v, is_active: v.is_active ? 1 : 0 }); setShowForm(true); };
+
+  const save = async () => {
+    if (!form.name.trim()) { setError('Vendor name is required'); return; }
+    setSaving(true); setError(''); setMessage('');
+    try {
+      await financeApi.vendorSave(form);
+      setMessage(form.id ? 'Vendor updated' : 'Vendor added');
+      setShowForm(false);
+      load();
+    } catch (err) {
+      setError(err.message || 'Failed to save vendor');
+    } finally { setSaving(false); }
+  };
+
+  const remove = async (v) => {
+    if (!window.confirm(`Delete vendor "${v.name}"? This only removes it from the vendor list — it does not change any recorded transactions.`)) return;
+    setError(''); setMessage('');
+    try { await financeApi.vendorDelete(v.id); setMessage('Vendor deleted'); load(); }
+    catch (err) { setError(err.message || 'Failed to delete vendor'); }
+  };
+
+  return (
+    <div>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900">Vendors</h2>
+          <p className="text-sm text-gray-500">Businesses you buy from or receive funds from (Amazon, a store, a supplier). These are not people, and they appear in the name search when you record income or an expense.</p>
+        </div>
+        <button className="btn-primary shrink-0" onClick={openNew}><Plus size={15} /> Add Vendor</button>
+      </div>
+
+      <div className="relative mb-4 max-w-xs">
+        <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <input className="input pl-9" placeholder="Search vendors..." value={search} onChange={e => setSearch(e.target.value)} />
+      </div>
+
+      {loading ? (
+        <div className="text-gray-400 text-sm py-8 text-center">Loading vendors...</div>
+      ) : vendors.length === 0 ? (
+        <div className="text-gray-400 text-sm py-8 text-center border border-dashed border-gray-200 rounded-lg">
+          No vendors yet. Click "Add Vendor" to create your first one (e.g. HC Store, Amazon).
+        </div>
+      ) : (
+        <div className="bg-white border border-gray-200 rounded-lg overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200 bg-gray-50">
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Name</th>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden sm:table-cell">Category</th>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Contact</th>
+                <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Used</th>
+                <th className="px-4 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {vendors.map(v => (
+                <tr key={v.id} className={`border-b border-gray-100 last:border-0 ${v.is_active ? '' : 'opacity-50'}`}>
+                  <td className="px-4 py-2">
+                    <div className="font-medium text-gray-900">{v.name}{!v.is_active && <span className="ml-2 text-xs text-gray-400">(inactive)</span>}</div>
+                    {v.website && <a href={v.website.startsWith('http') ? v.website : `https://${v.website}`} target="_blank" rel="noreferrer" className="text-xs text-primary-600 hover:underline">{v.website}</a>}
+                  </td>
+                  <td className="px-4 py-2 text-gray-600 hidden sm:table-cell">{v.category || '-'}</td>
+                  <td className="px-4 py-2 text-gray-600 hidden md:table-cell">
+                    {v.phone && <div>{v.phone}</div>}
+                    {v.email && <div className="text-xs text-gray-400">{v.email}</div>}
+                    {!v.phone && !v.email && '-'}
+                  </td>
+                  <td className="px-4 py-2 text-gray-500 text-xs hidden lg:table-cell">
+                    {(Number(v.donation_count) > 0 || Number(v.expense_count) > 0)
+                      ? [Number(v.expense_count) > 0 ? `${v.expense_count} expense${v.expense_count > 1 ? 's' : ''}` : '', Number(v.donation_count) > 0 ? `${v.donation_count} income` : ''].filter(Boolean).join(', ')
+                      : 'Not used yet'}
+                  </td>
+                  <td className="px-4 py-2 text-right whitespace-nowrap">
+                    <button className="text-gray-400 hover:text-primary-700 mr-3" onClick={() => openEdit(v)} title="Edit"><Edit2 size={15} /></button>
+                    <button className="text-gray-400 hover:text-red-600" onClick={() => remove(v)} title="Delete"><Trash2 size={15} /></button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Modal isOpen={showForm} onClose={() => setShowForm(false)} title={form.id ? 'Edit Vendor' : 'Add Vendor'}>
+        <div className="space-y-3">
+          <div><label className="label">Name <span className="text-red-500">*</span></label>
+            <input className="input" placeholder="e.g. HC Store" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} autoFocus /></div>
+          <div><label className="label">Category</label>
+            <input className="input" placeholder="e.g. Store, Supplies, Utilities" value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))} /></div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div><label className="label">Phone</label>
+              <input className="input" placeholder="Optional" value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} /></div>
+            <div><label className="label">Email</label>
+              <input className="input" placeholder="Optional" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} /></div>
+          </div>
+          <div><label className="label">Website</label>
+            <input className="input" placeholder="Optional" value={form.website} onChange={e => setForm(f => ({ ...f, website: e.target.value }))} /></div>
+          <div><label className="label">Address</label>
+            <input className="input" placeholder="Optional" value={form.address} onChange={e => setForm(f => ({ ...f, address: e.target.value }))} /></div>
+          <div><label className="label">Notes</label>
+            <textarea className="input" rows={2} placeholder="Optional" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} /></div>
+          <label className="flex items-center gap-2 text-sm text-gray-700">
+            <input type="checkbox" checked={!!form.is_active} onChange={e => setForm(f => ({ ...f, is_active: e.target.checked ? 1 : 0 }))} />
+            Active (show in the name search)
+          </label>
+          <div className="flex justify-end gap-2 pt-2">
+            <button className="btn-secondary" onClick={() => setShowForm(false)}>Cancel</button>
+            <button className="btn-primary" onClick={save} disabled={saving}>{saving ? 'Saving...' : (form.id ? 'Save Changes' : 'Add Vendor')}</button>
+          </div>
+        </div>
+      </Modal>
+    </div>
   );
 }
 

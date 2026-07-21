@@ -78,6 +78,13 @@ function ensurePersonForDonor($db, $donorName, $recordedBy) {
         if ($vs->fetchColumn()) return null;
     } catch (Exception $e) { /* expenses table optional */ }
 
+    // Don't turn a registered vendor / business (e.g. "Amazon", "HC Store") into a person.
+    try {
+        $vt = $db->prepare("SELECT 1 FROM vendors WHERE LOWER(TRIM(name)) = LOWER(?) LIMIT 1");
+        $vt->execute([$name]);
+        if ($vt->fetchColumn()) return null;
+    } catch (Exception $e) { /* vendors table optional */ }
+
     // Reuse an existing person with the same full name (avoid duplicates).
     try {
         $ms = $db->prepare("SELECT id FROM members WHERE LOWER(TRIM(CONCAT(first_name, ' ', last_name))) = LOWER(?) ORDER BY id ASC LIMIT 1");
@@ -635,6 +642,7 @@ switch ($method) {
             $searchFilter = $_GET['search'] ?? '';
             $page = max(1, (int)($_GET['page'] ?? 1));
             $limit = 50;
+            $fetchAll = !empty($_GET['all']); // PDF / print export wants every matching row
 
             $entries = [];
 
@@ -793,7 +801,7 @@ switch ($method) {
             $totalEntries = count($entries);
 
             $offset = ($page - 1) * $limit;
-            $pagedEntries = array_slice($entries, $offset, $limit);
+            $pagedEntries = $fetchAll ? $entries : array_slice($entries, $offset, $limit);
 
             jsonResponse([
                 'entries' => $pagedEntries,
@@ -832,6 +840,7 @@ switch ($method) {
             $page = max(1, (int)($_GET['page'] ?? 1));
             $limit = 50;
             $offset = ($page - 1) * $limit;
+            $fetchAll = !empty($_GET['all']); // PDF / print export wants every matching row
 
             $entries = [];
 
@@ -1009,7 +1018,7 @@ switch ($method) {
             $totalDebit = array_sum(array_column($entries, 'debit'));
             $totalCredit = array_sum(array_column($entries, 'credit'));
             $totalEntries = count($entries);
-            $pagedEntries = array_slice($entries, $offset, $limit);
+            $pagedEntries = $fetchAll ? $entries : array_slice($entries, $offset, $limit);
 
             jsonResponse([
                 'entries' => $pagedEntries,
@@ -1023,24 +1032,66 @@ switch ($method) {
             ]);
         }
 
-        // --- VENDORS LIST ---
+        // --- VENDORS LIST (names only, for autocomplete) ---
+        // Combines the registered vendor list with any legacy expense.vendor
+        // values so old expenses keep working before/without a migration.
         if ($action === 'vendors') {
-            $search = $_GET['search'] ?? '';
-            $sql = "SELECT DISTINCT vendor FROM expenses WHERE vendor IS NOT NULL AND vendor != ''";
-            $params = [];
-            if ($search) {
-                $sql .= " AND vendor LIKE ?";
-                $params[] = "%$search%";
+            $search = trim($_GET['search'] ?? '');
+            $names = [];
+            try {
+                $sql = "SELECT name FROM vendors WHERE is_active = 1";
+                $params = [];
+                if ($search !== '') { $sql .= " AND name LIKE ?"; $params[] = "%$search%"; }
+                $sql .= " ORDER BY name ASC LIMIT 200";
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                $names = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            } catch (Exception $e) { /* vendors table not created yet */ }
+
+            // Fold in distinct expense vendors that aren't in the table yet.
+            try {
+                $sql = "SELECT DISTINCT vendor FROM expenses WHERE vendor IS NOT NULL AND vendor != ''";
+                $params = [];
+                if ($search !== '') { $sql .= " AND vendor LIKE ?"; $params[] = "%$search%"; }
+                $sql .= " ORDER BY vendor ASC LIMIT 200";
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $v) { $names[] = $v; }
+            } catch (Exception $e) { /* expenses table optional */ }
+
+            // De-dupe case-insensitively, keep first spelling, sort alphabetically.
+            $seen = []; $vendors = [];
+            foreach ($names as $n) {
+                $k = strtolower(trim($n));
+                if ($k === '' || isset($seen[$k])) continue;
+                $seen[$k] = true; $vendors[] = $n;
             }
-            $sql .= " ORDER BY vendor ASC LIMIT 100";
-            $stmt = $db->prepare($sql);
-            $stmt->execute($params);
-            $vendors = $stmt->fetchAll(PDO::FETCH_COLUMN);
+            sort($vendors, SORT_NATURAL | SORT_FLAG_CASE);
             jsonResponse(['vendors' => $vendors]);
         }
 
-        // --- SAVE VENDOR (for future autocomplete) ---
-        // Vendors are stored as distinct expense.vendor values - no separate table needed
+        // --- VENDORS FULL (registry records for the Vendors tab) ---
+        if ($action === 'vendors_full') {
+            $search = trim($_GET['search'] ?? '');
+            try {
+                $sql = "SELECT v.*,
+                            (SELECT COUNT(*) FROM expenses e WHERE LOWER(TRIM(e.vendor)) = LOWER(TRIM(v.name))) AS expense_count,
+                            (SELECT COUNT(*) FROM donations d WHERE LOWER(TRIM(d.donor_name)) = LOWER(TRIM(v.name))) AS donation_count
+                        FROM vendors v";
+                $params = [];
+                if ($search !== '') {
+                    $sql .= " WHERE v.name LIKE ? OR v.category LIKE ?";
+                    $params[] = "%$search%"; $params[] = "%$search%";
+                }
+                $sql .= " ORDER BY v.is_active DESC, v.name ASC";
+                $stmt = $db->prepare($sql);
+                $stmt->execute($params);
+                jsonResponse(['vendors' => $stmt->fetchAll()]);
+            } catch (Exception $e) {
+                // Table missing -> empty list (migration not run yet).
+                jsonResponse(['vendors' => [], 'needs_migration' => true]);
+            }
+        }
 
         // --- TRANSFERS LIST ---
         if ($action === 'transfers') {
@@ -1616,6 +1667,81 @@ switch ($method) {
             jsonResponse(['donors' => $stmt->fetchAll()]);
         }
 
+        // Vendor statement: everything the church spent WITH a vendor (expenses)
+        // plus anything received FROM that business recorded by name (donations),
+        // over a date range. Mirrors the member giving statement but for vendors.
+        if ($action === 'vendor_statement') {
+            $vendorName = trim($_GET['vendor_name'] ?? '');
+            if ($vendorName === '') jsonResponse(['error' => 'vendor_name required'], 400);
+
+            $dateFrom = $_GET['date_from'] ?? date('Y-01-01');
+            $dateTo = $_GET['date_to'] ?? date('Y-12-31');
+
+            // Registered contact details, if this vendor is in the registry.
+            $vendor = ['name' => $vendorName, 'registered' => false];
+            try {
+                $vs = $db->prepare("SELECT name, category, phone, email, website, address, notes FROM vendors WHERE LOWER(TRIM(name)) = LOWER(?) LIMIT 1");
+                $vs->execute([$vendorName]);
+                if ($row = $vs->fetch()) {
+                    $vendor = array_merge($row, ['registered' => true]);
+                }
+            } catch (Exception $e) { /* vendors table optional */ }
+
+            // Purchases / bills paid to this vendor.
+            $purchases = [];
+            $totalPaid = 0;
+            try {
+                $pStmt = $db->prepare("
+                    SELECT e.id, e.expense_date, e.amount, e.description, e.payment_method,
+                           e.reference_number, ec.name AS category_name,
+                           a.name AS account_name
+                    FROM expenses e
+                    LEFT JOIN expense_categories ec ON ec.id = e.category_id
+                    LEFT JOIN accounts a ON a.id = e.source_account_id
+                    WHERE LOWER(TRIM(e.vendor)) = LOWER(?)
+                      AND e.expense_date BETWEEN ? AND ?
+                    ORDER BY e.expense_date ASC, e.id ASC
+                ");
+                $pStmt->execute([$vendorName, $dateFrom, $dateTo]);
+                foreach ($pStmt->fetchAll() as $r) {
+                    $purchases[] = $r;
+                    $totalPaid += (float)$r['amount'];
+                }
+            } catch (Exception $e) { /* ignore */ }
+
+            // Money received from this business, recorded as a name-only donation.
+            $income = [];
+            $totalReceived = 0;
+            try {
+                $iStmt = $db->prepare("
+                    SELECT d.id, d.donation_date, d.amount, d.payment_method,
+                           d.reference_number, d.notes, dc.name AS category_name
+                    FROM donations d
+                    LEFT JOIN donation_categories dc ON dc.id = d.category_id
+                    WHERE d.member_id IS NULL
+                      AND LOWER(TRIM(d.donor_name)) = LOWER(?)
+                      AND d.donation_date BETWEEN ? AND ?
+                    ORDER BY d.donation_date ASC, d.id ASC
+                ");
+                $iStmt->execute([$vendorName, $dateFrom, $dateTo]);
+                foreach ($iStmt->fetchAll() as $r) {
+                    $income[] = $r;
+                    $totalReceived += (float)$r['amount'];
+                }
+            } catch (Exception $e) { /* ignore */ }
+
+            jsonResponse([
+                'vendor' => $vendor,
+                'purchases' => $purchases,
+                'income' => $income,
+                'total_paid' => round($totalPaid, 2),
+                'total_received' => round($totalReceived, 2),
+                'net' => round($totalReceived - $totalPaid, 2),
+                'date_from' => $dateFrom,
+                'date_to' => $dateTo,
+            ]);
+        }
+
         // --- ONE LOAN TRANSACTION (for the edit form) ---
         if ($action === 'loan_entry') {
             $id = (int)($_GET['id'] ?? 0);
@@ -1891,6 +2017,40 @@ switch ($method) {
                 $currentUser['user_id'],
             ]);
             jsonResponse(['message' => 'Pledge created', 'id' => (int)$db->lastInsertId()], 201);
+        }
+
+        // --- CREATE / UPDATE A VENDOR (registry) ---
+        if ($action === 'vendor_save') {
+            $data = getRequestBody();
+            $name = trim($data['name'] ?? '');
+            if ($name === '') jsonResponse(['error' => 'Vendor name is required'], 400);
+            $vid = isset($data['id']) ? (int)$data['id'] : 0;
+
+            // No duplicate names (case-insensitive), except when editing that same row.
+            $dupe = $db->prepare("SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(?) AND id <> ? LIMIT 1");
+            $dupe->execute([$name, $vid]);
+            if ($dupe->fetchColumn()) jsonResponse(['error' => 'A vendor with that name already exists'], 409);
+
+            $fields = [
+                $name,
+                trim($data['category'] ?? '') ?: null,
+                trim($data['phone'] ?? '') ?: null,
+                trim($data['email'] ?? '') ?: null,
+                trim($data['website'] ?? '') ?: null,
+                trim($data['address'] ?? '') ?: null,
+                trim($data['notes'] ?? '') ?: null,
+                isset($data['is_active']) ? (int)!!$data['is_active'] : 1,
+            ];
+
+            if ($vid) {
+                $stmt = $db->prepare("UPDATE vendors SET name=?, category=?, phone=?, email=?, website=?, address=?, notes=?, is_active=?, updated_at=NOW() WHERE id=?");
+                $stmt->execute(array_merge($fields, [$vid]));
+                jsonResponse(['message' => 'Vendor updated', 'id' => $vid]);
+            } else {
+                $stmt = $db->prepare("INSERT INTO vendors (name, category, phone, email, website, address, notes, is_active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())");
+                $stmt->execute(array_merge($fields, [$currentUser['user_id']]));
+                jsonResponse(['message' => 'Vendor added', 'id' => (int)$db->lastInsertId()], 201);
+            }
         }
 
         // --- TRANSFER BETWEEN ACCOUNTS ---
@@ -2797,6 +2957,15 @@ switch ($method) {
         break;
 
     case 'DELETE':
+        // --- DELETE A VENDOR (registry) ---
+        // Names already recorded on donations/expenses are stored as plain text,
+        // so removing the registry row never touches existing transactions.
+        if ($action === 'vendor') {
+            if (!$id) jsonResponse(['error' => 'Vendor ID required'], 400);
+            $db->prepare("DELETE FROM vendors WHERE id = ?")->execute([$id]);
+            jsonResponse(['message' => 'Vendor deleted']);
+        }
+
         // --- DELETE A LOAN TRANSACTION (both sides at once) ---
         if ($action === 'loan_transaction') {
             requireRole($currentUser, ['pastor', 'admin']);
