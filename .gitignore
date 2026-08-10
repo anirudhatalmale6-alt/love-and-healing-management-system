@@ -1,4 +1,24 @@
-node_modules/
+# Dependencies
+frontend/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment overrides (if any local config files are used)
+.env
+.env.local
+api/debug-db.php
+api/reset-admin.php
+api/migrate.php
+.png
+
+# Server-only secrets (never commit)
 api/config.secret.php
-uploads/
-backups/
+config.secret.php
