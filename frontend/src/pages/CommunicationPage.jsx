@@ -4,10 +4,11 @@ import { loadPersonTypes, DEFAULT_PERSON_TYPES } from '../utils/personTypes';
 import { useAuth } from '../contexts/AuthContext';
 import Modal from '../components/Modal';
 import Pagination from '../components/Pagination';
+import { formatStampChurch, formatClockChurch, isChurchToday } from '../utils/format';
 import {
   Send, Mail, MessageSquare, Settings, Plus, Trash2, Eye, Check, X, Edit2,
   AlertCircle, Search, Users, Clock, CheckCircle, XCircle, Filter,
-  QrCode, ClipboardList, BarChart3
+  QrCode, ClipboardList, BarChart3, Inbox, ArrowLeft, RefreshCw
 } from 'lucide-react';
 
 const typeColors = { sent: 'bg-green-100 text-green-700', draft: 'bg-gray-100 text-gray-700', queued: 'bg-blue-100 text-blue-700', sending: 'bg-amber-100 text-amber-700', failed: 'bg-red-100 text-red-700' };
@@ -17,9 +18,21 @@ export default function CommunicationPage() {
   const [tab, setTab] = useState('compose');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [unread, setUnread] = useState(0);
+
+  const refreshUnread = useCallback(async () => {
+    try { const r = await msgApi.inboxUnread(); setUnread(r.unread || 0); } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    refreshUnread();
+    const t = setInterval(refreshUnread, 60000);
+    return () => clearInterval(t);
+  }, [refreshUnread]);
 
   const tabs = [
     { key: 'compose', label: 'Compose', icon: Send },
+    { key: 'inbox', label: 'Inbox', icon: Inbox, badge: unread },
     { key: 'sent', label: 'Sent Messages', icon: Mail },
     { key: 'surveys', label: 'Surveys', icon: ClipboardList },
     { key: 'qrcode', label: 'QR Codes', icon: QrCode },
@@ -40,6 +53,11 @@ export default function CommunicationPage() {
           <button key={t.key} onClick={() => { setTab(t.key); setError(''); setMessage(''); }}
             className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.key ? 'bg-primary-700 text-white' : 'bg-white text-gray-600 border border-gray-300 hover:bg-gray-50'}`}>
             <t.icon size={15} className="inline mr-1 -mt-0.5" /> {t.label}
+            {t.badge > 0 && (
+              <span className={`ml-1.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full text-[11px] font-semibold ${tab === t.key ? 'bg-white text-primary-700' : 'bg-red-600 text-white'}`}>
+                {t.badge}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -58,6 +76,7 @@ export default function CommunicationPage() {
       )}
 
       {tab === 'compose' && <ComposeTab setError={setError} setMessage={setMessage} />}
+      {tab === 'inbox' && <InboxTab setError={setError} onRead={refreshUnread} />}
       {tab === 'sent' && <SentTab setError={setError} />}
       {tab === 'surveys' && <SurveysTab setError={setError} setMessage={setMessage} />}
       {tab === 'qrcode' && <QRCodeTab />}
@@ -67,13 +86,16 @@ export default function CommunicationPage() {
 }
 
 function ComposeTab({ setError, setMessage }) {
+  const { canEdit, hasSectionAccess } = useAuth();
+  const canSend = canEdit && hasSectionAccess('communication', 'send');
   const [membersList, setMembersList] = useState([]);
   const [groupsList, setGroupsList] = useState([]);
   const [messageType, setMessageType] = useState('email');
-  const [recipientType, setRecipientType] = useState('individual');
+  // Gloo-style: build ONE recipient list from groups + individuals (mode 'people'),
+  // or send to ad-hoc emails/phones (mode 'direct'). Each person always gets their
+  // own private message — no one sees who else is in the group.
+  const [mode, setMode] = useState('people');
   const [recipientIds, setRecipientIds] = useState([]);
-  const [groupName, setGroupName] = useState('');
-  const [personType, setPersonType] = useState('');
   const [subject, setSubject] = useState('');
   const [body, setBody] = useState('');
   const [sendType, setSendType] = useState('now');
@@ -106,31 +128,52 @@ function ComposeTab({ setError, setMessage }) {
     return (m.first_name + ' ' + m.last_name + ' ' + (m.email || '')).toLowerCase().includes(s);
   });
 
+  // Can this person actually be reached on the chosen channel?
+  const reachable = (m) => {
+    if (messageType === 'sms') return !!(m.phone && m.sms_consent);
+    if (messageType === 'both') return !!(m.email || (m.phone && m.sms_consent));
+    return !!m.email;
+  };
+  // Members of a group (by real group_ids), only those we can reach.
+  const groupMembers = (gid) => membersList.filter(m => Array.isArray(m.group_ids) && m.group_ids.includes(gid) && m.status === 'active' && reachable(m));
+  const groupState = (gid) => {
+    const ids = groupMembers(gid).map(m => m.id);
+    if (ids.length === 0) return 'empty';
+    const inSel = ids.filter(id => recipientIds.includes(id)).length;
+    if (inSel === 0) return 'none';
+    if (inSel === ids.length) return 'all';
+    return 'some';
+  };
+  const toggleGroup = (gid) => {
+    const ids = groupMembers(gid).map(m => m.id);
+    if (ids.length === 0) return;
+    const st = groupState(gid);
+    setRecipientIds(prev => st === 'all' ? prev.filter(id => !ids.includes(id)) : [...new Set([...prev, ...ids])]);
+  };
+  const addEveryone = () => setRecipientIds([...new Set(membersList.filter(m => m.status === 'active' && reachable(m)).map(m => m.id))]);
+  const addByType = (t) => setRecipientIds(prev => [...new Set([...prev, ...membersList.filter(m => m.person_type === t && m.status === 'active' && reachable(m)).map(m => m.id)])]);
+
   const toggleRecipient = (id) => {
     setRecipientIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
   const getRecipientCount = () => {
-    if (recipientType === 'individual') return recipientIds.length;
-    if (recipientType === 'group') return membersList.filter(m => m.family_group && m.family_group.includes(groupName) && m.status === 'active').length;
-    if (recipientType === 'person_type') return membersList.filter(m => m.person_type === personType && m.status === 'active').length;
-    if (recipientType === 'direct') return directContacts.length;
-    if (recipientType === 'all') return membersList.filter(m => m.status === 'active').length;
-    return 0;
+    if (mode === 'direct') return directContacts.length;
+    return recipientIds.length;
   };
 
   const handleSend = async () => {
     if (!body.trim()) { setError('Message body is required'); return; }
     if (messageType === 'email' && !subject.trim()) { setError('Subject is required for email'); return; }
-    if (recipientType === 'individual' && recipientIds.length === 0) { setError('Select at least one recipient'); return; }
+    if (mode === 'people' && recipientIds.length === 0) { setError('Select at least one recipient'); return; }
     // Auto-add direct input if user typed something but didn't click Add
     let finalDirectContacts = [...directContacts];
-    if (recipientType === 'direct' && directInput.trim()) {
+    if (mode === 'direct' && directInput.trim()) {
       finalDirectContacts.push(directInput.trim());
       setDirectContacts(finalDirectContacts);
       setDirectInput('');
     }
-    if (recipientType === 'direct' && finalDirectContacts.length === 0) { setError('Add at least one email or phone number'); return; }
+    if (mode === 'direct' && finalDirectContacts.length === 0) { setError('Add at least one email or phone number'); return; }
     if (sendType === 'recurring' && !recurringPattern) { setError('Select a recurring pattern'); return; }
 
     setSending(true);
@@ -141,16 +184,14 @@ function ComposeTab({ setError, setMessage }) {
         send_type: sendType,
         subject: subject || '',
         body: messageType === 'email' ? (body || '').replace(/\n/g, '<br>') : (body || ''),
-        recipient_type: recipientType,
-        recipient_ids: recipientType === 'individual' ? recipientIds : [],
-        group_name: groupName || '',
-        person_type: personType || '',
+        recipient_type: mode === 'direct' ? 'direct' : 'individual',
+        recipient_ids: mode === 'people' ? recipientIds : [],
         scheduled_at: sendType === 'scheduled' ? scheduledAt : null,
         recurring_pattern: sendType === 'recurring' ? recurringPattern : null,
         attachment_name: attachmentNames.length > 0 ? attachmentNames[0] : null,
         attachment_names: attachmentNames.length > 0 ? attachmentNames : null,
       };
-      if (recipientType === 'direct') {
+      if (mode === 'direct') {
         sendData.direct_contacts = (finalDirectContacts || []).map(c => {
           if (typeof c === 'string') {
             return c.includes('@') ? { email: c, phone: null, name: c } : { email: null, phone: c, name: c };
@@ -229,13 +270,10 @@ function ComposeTab({ setError, setMessage }) {
               </div>
               <div>
                 <label className="label">Send To</label>
-                <select className="input" value={recipientType} onChange={e => setRecipientType(e.target.value)}>
-                  <option value="individual">Select People</option>
-                  <option value="group">Group</option>
-                  <option value="person_type">By Type</option>
-                  <option value="direct">Direct (email/phone)</option>
-                  <option value="all">Everyone (Active)</option>
-                </select>
+                <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+                  <button type="button" onClick={() => setMode('people')} className={`flex-1 px-3 py-2 text-sm font-medium ${mode === 'people' ? 'bg-primary-700 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>People &amp; Groups</button>
+                  <button type="button" onClick={() => setMode('direct')} className={`flex-1 px-3 py-2 text-sm font-medium border-l border-gray-300 ${mode === 'direct' ? 'bg-primary-700 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>Direct email/phone</button>
+                </div>
               </div>
               <div>
                 <label className="label">When</label>
@@ -247,29 +285,7 @@ function ComposeTab({ setError, setMessage }) {
               </div>
             </div>
 
-            {recipientType === 'group' && (
-              <div className="mb-4">
-                <label className="label">Select Group</label>
-                <select className="input" value={groupName} onChange={e => setGroupName(e.target.value)}>
-                  <option value="">-- Choose group --</option>
-                  {groupsList.map(g => <option key={g.id} value={g.name}>{g.name}</option>)}
-                </select>
-              </div>
-            )}
-
-            {recipientType === 'person_type' && (
-              <div className="mb-4">
-                <label className="label">Select Type</label>
-                <select className="input" value={personType} onChange={e => setPersonType(e.target.value)}>
-                  <option value="">-- Choose --</option>
-                  {personTypes.map(t => (
-                    <option key={t.value} value={t.value}>{t.label}</option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            {recipientType === 'direct' && (
+            {mode === 'direct' && (
               <div className="mb-4 space-y-3">
                 <div>
                   <label className="label">Enter Email or Phone</label>
@@ -416,31 +432,65 @@ function ComposeTab({ setError, setMessage }) {
               <div className="text-sm text-gray-500">
                 {getRecipientCount()} recipient{getRecipientCount() !== 1 ? 's' : ''}
               </div>
-              <button onClick={handleSend} disabled={sending || notConfigured} className="btn-primary">
-                {sending ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Send size={16} />}
-                {sendType === 'now' ? 'Send Now' : 'Schedule'}
-              </button>
+              {canSend ? (
+                <button onClick={handleSend} disabled={sending || notConfigured} className="btn-primary">
+                  {sending ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Send size={16} />}
+                  {sendType === 'now' ? 'Send Now' : 'Schedule'}
+                </button>
+              ) : (
+                <span className="text-sm text-gray-400 italic">View only — you don't have permission to send messages.</span>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Recipient selector */}
-        {recipientType === 'individual' && (
+        {/* Gloo-style recipient selector: groups + individuals in one place */}
+        {mode === 'people' && (
           <div className="card">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-gray-700">Select Recipients</h3>
+              <h3 className="text-sm font-semibold text-gray-700">Recipients</h3>
               <span className="text-xs text-gray-500">{recipientIds.length} selected</span>
             </div>
-            <div className="relative mb-3">
-              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-              <input className="input pl-9 py-1.5 text-sm" placeholder="Search..." value={memberSearch} onChange={e => setMemberSearch(e.target.value)} />
+
+            {/* Quick add */}
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              <button type="button" onClick={addEveryone} className="px-2 py-1 text-xs rounded-full bg-primary-50 text-primary-700 hover:bg-primary-100 font-medium">+ Everyone (active)</button>
+              {personTypes.map(t => (
+                <button key={t.value} type="button" onClick={() => addByType(t.value)} className="px-2 py-1 text-xs rounded-full bg-gray-100 text-gray-600 hover:bg-gray-200 font-medium" title={`Add all ${t.label}`}>+ {t.label}</button>
+              ))}
+              {recipientIds.length > 0 && <button type="button" onClick={() => setRecipientIds([])} className="px-2 py-1 text-xs rounded-full bg-red-50 text-red-600 hover:bg-red-100 font-medium">Clear all</button>}
             </div>
-            <div className="max-h-96 overflow-y-auto space-y-1">
-              {filteredMembers.slice(0, 100).map(m => {
+
+            {/* Groups — one click selects the whole group */}
+            {groupsList.length > 0 && (
+              <div className="mb-3">
+                <div className="text-xs font-semibold text-gray-500 uppercase mb-1.5">Groups (tap to add everyone in it)</div>
+                <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto">
+                  {groupsList.map(g => {
+                    const st = groupState(g.id);
+                    const count = groupMembers(g.id).length;
+                    return (
+                      <button key={g.id} type="button" onClick={() => toggleGroup(g.id)} disabled={count === 0}
+                        title={count === 0 ? 'No reachable members on this channel' : `${count} reachable`}
+                        className={`px-2.5 py-1 text-xs rounded-full font-medium border transition-colors ${st === 'all' ? 'bg-primary-700 text-white border-primary-700' : st === 'some' ? 'bg-primary-50 text-primary-700 border-primary-300' : count === 0 ? 'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}>
+                        {st === 'all' ? <Check size={11} className="inline mr-0.5 -mt-0.5" /> : null}{g.name} <span className="opacity-60">({count})</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Individuals */}
+            <div className="text-xs font-semibold text-gray-500 uppercase mb-1.5">Individuals</div>
+            <div className="relative mb-2">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input className="input pl-9 py-1.5 text-sm" placeholder="Search people..." value={memberSearch} onChange={e => setMemberSearch(e.target.value)} />
+            </div>
+            <div className="max-h-80 overflow-y-auto space-y-1">
+              {filteredMembers.slice(0, 200).map(m => {
                 const selected = recipientIds.includes(m.id);
-                // For SMS a phone number alone isn't enough - they must have consented.
-                const smsReady = m.phone && m.sms_consent;
-                const hasContact = messageType === 'sms' ? smsReady : m.email;
+                const hasContact = reachable(m);
                 return (
                   <label key={m.id} className={`flex items-center gap-2 p-2 rounded cursor-pointer text-sm ${selected ? 'bg-primary-50' : 'hover:bg-gray-50'} ${!hasContact ? 'opacity-40' : ''}`}>
                     <input type="checkbox" checked={selected} onChange={() => toggleRecipient(m.id)} disabled={!hasContact} className="rounded" />
@@ -455,7 +505,9 @@ function ComposeTab({ setError, setMessage }) {
                   </label>
                 );
               })}
+              {filteredMembers.length > 200 && <div className="text-xs text-gray-400 text-center py-2">Showing first 200 — use search to narrow.</div>}
             </div>
+            <p className="text-[11px] text-gray-400 mt-2">Each person gets their own private message — no one sees who else received it.</p>
           </div>
         )}
       </div>
@@ -516,6 +568,7 @@ function SentTab({ setError }) {
                   <tr>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Date</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Subject</th>
+                    <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Sent By</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Type</th>
                     <th className="text-center px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Recipients</th>
                     <th className="text-center px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
@@ -525,8 +578,9 @@ function SentTab({ setError }) {
                 <tbody className="divide-y divide-gray-100">
                   {messages.map(m => (
                     <tr key={m.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 text-sm text-gray-600">{new Date(m.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })}</td>
+                      <td className="px-4 py-3 text-sm text-gray-600">{formatStampChurch(m.created_at, { year: 'numeric' })}</td>
                       <td className="px-4 py-3 text-sm font-medium text-gray-900 max-w-[200px] truncate">{m.subject || '(No subject)'}</td>
+                      <td className="px-4 py-3 text-sm text-gray-600">{m.created_by_name || '—'}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 capitalize">{m.message_type}</td>
                       <td className="px-4 py-3 text-center">
                         <span className="text-sm">{m.sent_count || 0}/{m.total_recipients || 0}</span>
@@ -552,7 +606,7 @@ function SentTab({ setError }) {
       </div>
 
       <Modal isOpen={!!viewMsg} onClose={() => { setViewMsg(null); setViewData(null); }} title={viewMsg?.subject || 'Message'} size="lg">
-        {viewData ? (
+        {viewData && viewMsg ? (
           <div className="space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div className="bg-gray-50 rounded-lg p-3"><div className="text-xs text-gray-500">Type</div><div className="text-sm font-medium capitalize">{viewMsg.message_type}</div></div>
@@ -560,6 +614,9 @@ function SentTab({ setError }) {
               <div className="bg-gray-50 rounded-lg p-3"><div className="text-xs text-gray-500">Failed</div><div className="text-sm font-medium">{viewMsg.failed_count || 0}</div></div>
               <div className="bg-gray-50 rounded-lg p-3"><div className="text-xs text-gray-500">Status</div><div className="text-sm font-medium capitalize">{viewMsg.status}</div></div>
             </div>
+            {viewMsg.created_by_name && (
+              <div className="text-xs text-gray-500">Sent by <span className="font-medium text-gray-700">{viewMsg.created_by_name}</span></div>
+            )}
             <div className="border rounded-lg p-4 bg-white">
               <div className="text-sm text-gray-700" dangerouslySetInnerHTML={{ __html: viewData.message?.body || '' }} />
             </div>
@@ -601,24 +658,196 @@ function SentTab({ setError }) {
   );
 }
 
+function fmtSmsTime(ts) {
+  if (!ts) return '';
+  // Times are always shown on the church's clock (Philadelphia), not the clock of
+  // whatever device happens to be open.
+  if (isChurchToday(ts)) return formatClockChurch(ts);
+  return formatStampChurch(ts) || ts;
+}
+
+const SMS_STATUS = {
+  new:      { label: 'New',         cls: 'bg-red-100 text-red-700' },
+  awaiting: { label: 'Needs reply', cls: 'bg-amber-100 text-amber-700' },
+  replied:  { label: 'Replied',     cls: 'bg-green-100 text-green-700' },
+  done:     { label: 'Done',        cls: 'bg-gray-100 text-gray-500' },
+};
+
+function InboxTab({ setError, onRead }) {
+  const [convos, setConvos] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState(null); // phone
+  const [thread, setThread] = useState(null);      // { phone, messages, member, state }
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [reply, setReply] = useState('');
+  const [sending, setSending] = useState(false);
+  const [statusBusy, setStatusBusy] = useState(false);
+
+  const markStatus = async (status) => {
+    if (!thread) return;
+    setStatusBusy(true);
+    try {
+      await msgApi.setSmsStatus(thread.phone, status);
+      setThread(t => ({ ...t, state: status }));
+      loadInbox();
+    } catch (e) { setError(e.message); }
+    setStatusBusy(false);
+  };
+
+  const loadInbox = useCallback(async () => {
+    setLoading(true);
+    try { const r = await msgApi.inbox(); setConvos(r.conversations || []); }
+    catch (e) { setError(e.message); }
+    setLoading(false);
+  }, [setError]);
+
+  useEffect(() => { loadInbox(); }, [loadInbox]);
+
+  const openThread = async (phone) => {
+    setSelected(phone);
+    setThreadLoading(true);
+    setThread(null);
+    try {
+      const r = await msgApi.thread(phone);
+      setThread(r);
+      setConvos(cs => cs.map(c => c.phone === phone ? { ...c, unread: 0 } : c));
+      onRead && onRead();
+    } catch (e) { setError(e.message); }
+    setThreadLoading(false);
+  };
+
+  const sendReply = async () => {
+    if (!reply.trim() || !thread) return;
+    setSending(true);
+    try {
+      await msgApi.reply({ phone: thread.phone, member_id: thread.member?.id, body: reply.trim() });
+      setReply('');
+      const r = await msgApi.thread(thread.phone);
+      setThread(r);
+      loadInbox();
+    } catch (e) { setError(e.message); }
+    setSending(false);
+  };
+
+  const initials = (name) => name ? name.split(' ').filter(Boolean).map(s => s[0]).slice(0, 2).join('').toUpperCase() : '#';
+
+  return (
+    <div className="card p-0 overflow-hidden">
+      <div className="grid md:grid-cols-3">
+        {/* Conversation list */}
+        <div className={`md:col-span-1 border-r border-gray-100 ${selected ? 'hidden md:block' : ''}`}>
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+            <h3 className="font-semibold text-gray-900">Text messages</h3>
+            <button onClick={loadInbox} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-gray-50 rounded-lg" title="Refresh"><RefreshCw size={15} /></button>
+          </div>
+          <div className="max-h-[560px] overflow-y-auto">
+            {loading ? (
+              <div className="p-8 text-center"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary-700 mx-auto" /></div>
+            ) : convos.length === 0 ? (
+              <div className="p-8 text-center text-gray-400 text-sm">
+                <MessageSquare size={28} className="mx-auto mb-2 text-gray-300" />
+                No text conversations yet. When someone replies to one of your texts, it shows up here.
+              </div>
+            ) : convos.map(c => (
+              <button key={c.phone} onClick={() => openThread(c.phone)}
+                className={`w-full text-left px-4 py-3 border-b border-gray-50 hover:bg-gray-50 transition-colors flex items-center gap-3 ${selected === c.phone ? 'bg-primary-50' : ''}`}>
+                <div className="w-9 h-9 rounded-full bg-primary-700 text-white flex items-center justify-center text-xs font-medium shrink-0">{initials(c.name)}</div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm font-medium text-gray-900 truncate">{c.name || c.phone}</span>
+                    <span className="text-[11px] text-gray-400 shrink-0">{fmtSmsTime(c.last_at)}</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <span className={`text-xs truncate ${c.unread > 0 ? 'text-gray-900 font-medium' : 'text-gray-500'}`}>
+                      {c.last_dir === 'out' ? 'You: ' : ''}{c.last_body}
+                    </span>
+                    {SMS_STATUS[c.status] && (
+                      <span className={`ml-auto shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${SMS_STATUS[c.status].cls}`}>
+                        {SMS_STATUS[c.status].label}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Thread + reply */}
+        <div className={`md:col-span-2 flex-col ${!selected ? 'hidden md:flex' : 'flex'}`} style={{ minHeight: 420 }}>
+          {!selected ? (
+            <div className="flex-1 flex items-center justify-center text-gray-400 text-sm p-8">Pick a conversation to read and reply.</div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
+                <button onClick={() => { setSelected(null); setThread(null); }} className="md:hidden p-1.5 text-gray-500 hover:bg-gray-50 rounded-lg"><ArrowLeft size={18} /></button>
+                <div className="min-w-0">
+                  <div className="font-semibold text-gray-900 truncate">{thread?.member ? `${thread.member.first_name} ${thread.member.last_name}` : selected}</div>
+                  <div className="text-xs text-gray-400">{selected}{thread?.member && thread.member.sms_opted_out_at ? ' · opted out of texts' : ''}</div>
+                </div>
+                <div className="ml-auto shrink-0">
+                  {thread?.state === 'done' ? (
+                    <button onClick={() => markStatus('open')} disabled={statusBusy} className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50">Reopen</button>
+                  ) : (
+                    <button onClick={() => markStatus('done')} disabled={statusBusy} className="text-xs px-2.5 py-1.5 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-1"><Check size={13} /> Mark done</button>
+                  )}
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2 bg-gray-50" style={{ maxHeight: 460 }}>
+                {threadLoading ? (
+                  <div className="p-8 text-center"><div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary-700 mx-auto" /></div>
+                ) : (thread?.messages || []).length === 0 ? (
+                  <div className="text-center text-gray-400 text-sm py-8">No messages yet.</div>
+                ) : (thread?.messages || []).map(m => (
+                  <div key={m.id} className={`flex ${m.direction === 'out' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm ${m.direction === 'out' ? 'bg-primary-700 text-white rounded-br-sm' : 'bg-white border border-gray-200 text-gray-800 rounded-bl-sm'}`}>
+                      <div className="whitespace-pre-wrap break-words">{m.body}</div>
+                      <div className={`text-[10px] mt-1 ${m.direction === 'out' ? 'text-primary-200' : 'text-gray-400'}`}>
+                        {fmtSmsTime(m.created_at)}{m.direction === 'out' && m.sent_by_name ? ` · ${m.sent_by_name}` : ''}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="border-t border-gray-100 p-3 flex items-end gap-2">
+                <textarea rows="1" value={reply} onChange={e => setReply(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendReply(); } }}
+                  placeholder="Type a reply..." className="input flex-1 resize-none" />
+                <button onClick={sendReply} disabled={sending || !reply.trim()} className="btn-primary shrink-0">
+                  {sending ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Send size={16} />}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsTab({ setError, setMessage }) {
   const [config, setConfig] = useState({
     msg_sendgrid_key: '', msg_from_email: '', msg_from_name: '',
     msg_twilio_sid: '', msg_twilio_token: '', msg_twilio_number: '',
   });
+  const [copy, setCopy] = useState({ enabled: false, phone: '', email: '' });
   const [saving, setSaving] = useState(false);
   const [testEmail, setTestEmail] = useState('');
 
   useEffect(() => {
     msgApi.config().then(d => {
       setConfig(prev => ({ ...prev, msg_from_email: d.from_email || '', msg_from_name: d.from_name || '' }));
+      setCopy({ enabled: !!d.copy_enabled, phone: d.copy_phone || '', email: d.copy_email || '' });
     }).catch(() => {});
   }, []);
 
   const handleSave = async () => {
     const toSave = {};
     Object.entries(config).forEach(([k, v]) => { if (v && v.trim()) toSave[k] = v.trim(); });
-    if (Object.keys(toSave).length === 0) { setError('Please fill in at least one field'); return; }
+    // Monitoring-copy settings always go up (so they can be turned off / cleared).
+    toSave.msg_copy_enabled = copy.enabled ? '1' : '';
+    toSave.msg_copy_phone = (copy.phone || '').trim();
+    toSave.msg_copy_email = (copy.email || '').trim();
     setSaving(true);
     try {
       const result = await msgApi.saveConfig(toSave);
@@ -682,6 +911,27 @@ function SettingsTab({ setError, setMessage }) {
             <input className="input" placeholder="+1234567890" value={config.msg_twilio_number} onChange={e => setConfig(c => ({ ...c, msg_twilio_number: e.target.value }))} />
           </div>
           <p className="text-xs text-gray-400">Get your Twilio credentials at twilio.com/console</p>
+        </div>
+      </div>
+
+      <div className="card mb-6">
+        <h3 className="text-lg font-semibold text-gray-900 mb-1 flex items-center gap-2"><Inbox size={20} /> Message Copies &amp; Monitoring</h3>
+        <p className="text-sm text-gray-500 mb-4">Keep an eye on everything the team sends. When this is on, a copy of every text or email your team sends out is also sent to the church phone and/or an admin email you choose. One short summary per message &mdash; not one per person.</p>
+        <label className="flex items-center gap-2 text-sm cursor-pointer mb-4">
+          <input type="checkbox" checked={copy.enabled} onChange={e => setCopy(c => ({ ...c, enabled: e.target.checked }))} className="rounded" />
+          <span className="font-medium text-gray-800">Send me a copy of every message the team sends</span>
+        </label>
+        <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 ${copy.enabled ? '' : 'opacity-50 pointer-events-none'}`}>
+          <div>
+            <label className="label">Church / Admin phone (for a text copy)</label>
+            <input className="input" placeholder="+1234567890" value={copy.phone} onChange={e => setCopy(c => ({ ...c, phone: e.target.value }))} />
+            <p className="text-xs text-gray-400 mt-1">A short text summary is sent here.</p>
+          </div>
+          <div>
+            <label className="label">Admin email (for an email copy)</label>
+            <input className="input" placeholder="admin@yourchurch.org" value={copy.email} onChange={e => setCopy(c => ({ ...c, email: e.target.value }))} />
+            <p className="text-xs text-gray-400 mt-1">Leave either field blank to skip that channel.</p>
+          </div>
         </div>
       </div>
 
@@ -830,7 +1080,7 @@ function SurveysTab({ setError, setMessage }) {
               <div key={r.id} className="border rounded-lg p-3">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-sm font-medium text-gray-900">{r.first_name ? `${r.first_name} ${r.last_name}` : (r.respondent_name || 'Anonymous')}</span>
-                  <span className="text-xs text-gray-400">{new Date(r.created_at).toLocaleDateString()}</span>
+                  <span className="text-xs text-gray-400">{formatStampChurch(r.created_at, { year: 'numeric', hour: undefined, minute: undefined })}</span>
                 </div>
                 {(viewResponses?.questions || []).map((q, qi) => (
                   <div key={qi} className="mb-1">

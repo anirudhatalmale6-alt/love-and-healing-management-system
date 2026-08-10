@@ -123,6 +123,7 @@ export const members = {
   create: (data) => request('members.php', { method: 'POST', body: data }),
   update: (id, data) => request('members.php', { method: 'PUT', body: data, params: { id } }),
   delete: (id) => request('members.php', { method: 'DELETE', params: { id } }),
+  bulkDelete: (ids) => request('members.php', { method: 'DELETE', params: { ids: ids.join(',') } }),
   import: (contacts) => request('members.php', { method: 'POST', body: { contacts }, params: { action: 'import' } }),
   autoStatus: () => request('members.php', { method: 'POST', params: { action: 'auto_status' } }),
   uploadPhoto: async (memberId, file) => {
@@ -174,6 +175,9 @@ export const groups = {
   create: (data) => request('groups.php', { method: 'POST', body: data }),
   update: (id, data) => request('groups.php', { method: 'PUT', body: data, params: { id } }),
   delete: (id) => request('groups.php', { method: 'DELETE', params: { id } }),
+  reorder: (groupIds) => request('groups.php', { method: 'PUT', body: { group_ids: groupIds }, params: { action: 'reorder' } }),
+  reorderMembers: (groupId, memberIds) => request('groups.php', { method: 'PUT', body: { group_id: groupId, member_ids: memberIds }, params: { action: 'reorder_members' } }),
+  setMemberTitle: (groupId, memberId, functionTitle) => request('groups.php', { method: 'PUT', body: { group_id: groupId, member_id: memberId, function_title: functionTitle }, params: { action: 'set_title' } }),
 };
 
 // Households
@@ -189,7 +193,7 @@ export const households = {
 export const reports = {
   memberGrowth: (months) => request('reports.php', { params: { action: 'member_growth', months } }),
   engagement: (period, serviceType) => request('reports.php', { params: { action: 'engagement', period, service_type: serviceType || '' } }),
-  engagementMember: (memberId, period, serviceType) => request('reports.php', { params: { action: 'engagement_member', member_id: memberId, period, service_type: serviceType || '' } }),
+  engagementMember: (memberId, period, serviceType, dateFrom, dateTo) => request('reports.php', { params: { action: 'engagement_member', member_id: memberId, period, service_type: serviceType || '', ...(dateFrom ? { date_from: dateFrom } : {}), ...(dateTo ? { date_to: dateTo } : {}) } }),
   inactive: (days) => request('reports.php', { params: { action: 'inactive', days } }),
   directory: () => request('reports.php', { params: { action: 'directory' } }),
   attendanceSummary: (params) => request('reports.php', { params: { action: 'attendance_summary', ...params } }),
@@ -340,6 +344,8 @@ export const finance = {
   accountTransactions: (id, params) => request('finance.php', { params: { action: 'account_transactions', id, ...params } }),
   // Transfers
   transfer: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'transfer' } }),
+  updateTransfer: (id, data) => request('finance.php', { method: 'PUT', body: data, params: { action: 'transfer', id } }),
+  transferEntry: (id) => request('finance.php', { params: { action: 'transfer_entry', id } }),
   transfers: (params) => request('finance.php', { params: { action: 'transfers', ...params } }),
   // Balance Sheet & Journal
   balanceSheet: (dateFrom, dateTo) => request('finance.php', { params: { action: 'balance_sheet', date_from: dateFrom, date_to: dateTo } }),
@@ -350,7 +356,14 @@ export const finance = {
   routingRules: () => request('finance.php', { params: { action: 'routing_rules' } }),
   saveRoutingRule: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'routing_rule' } }),
   deleteRoutingRule: (id) => request('finance.php', { method: 'DELETE', params: { action: 'routing_rule', id } }),
-  // Loans
+  // Loans & Receivables register
+  loans: () => request('finance.php', { params: { action: 'loans' } }),
+  loanDetail: (id) => request('finance.php', { params: { action: 'loan_detail', id } }),
+  saveLoan: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'loan_save' } }),
+  repayLoan: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'loan_repay' } }),
+  deleteLoanRecord: (id) => request('finance.php', { method: 'DELETE', params: { action: 'loan_record', id } }),
+  deleteLoanRepayment: (id) => request('finance.php', { method: 'DELETE', params: { action: 'loan_repayment', id } }),
+  // Loans (church as borrower — legacy two-sided ledger loans)
   loanTransaction: (data) => request('finance.php', { method: 'POST', body: data, params: { action: 'loan_transaction' } }),
   loanEntry: (id) => request('finance.php', { params: { action: 'loan_entry', id } }),
   updateLoanTransaction: (id, data) => request('finance.php', { method: 'PUT', body: data, params: { action: 'loan_transaction', id } }),
@@ -388,6 +401,11 @@ export const messaging = {
   consentStats: () => request('messaging.php', { params: { action: 'consent_stats' } }),
   saveConfig: (data) => request('messaging.php', { method: 'POST', body: data, params: { action: 'config' } }),
   testEmail: (email) => request('messaging.php', { method: 'POST', body: { email }, params: { action: 'test_email' } }),
+  inbox: () => request('messaging.php', { params: { action: 'inbox' } }),
+  inboxUnread: () => request('messaging.php', { params: { action: 'inbox_unread' } }),
+  thread: (phone, memberId) => request('messaging.php', { params: { action: 'thread', phone, id: memberId } }),
+  reply: (data) => request('messaging.php', { method: 'POST', body: data, params: { action: 'reply' } }),
+  setSmsStatus: (phone, status) => request('messaging.php', { method: 'POST', body: { phone, status }, params: { action: 'set_status' } }),
 };
 
 // Surveys
@@ -460,6 +478,7 @@ export const documents = {
   },
   update: (id, data) => request('documents.php', { method: 'PUT', body: data, params: { id } }),
   delete: (id) => request('documents.php', { method: 'DELETE', params: { id } }),
+  bulkDelete: (ids) => request('documents.php', { method: 'DELETE', params: { ids: ids.join(',') } }),
   downloadUrl: (id) => `${API_BASE}/documents.php?action=download&id=${id}&token=${getToken()}`,
   viewUrl: (id) => `${API_BASE}/documents.php?action=view&id=${id}&token=${getToken()}`,
 };
@@ -496,6 +515,7 @@ export const meetingNotes = {
 export const auditLog = {
   list: (params) => request('audit_log.php', { params }),
   delete: (id) => request('audit_log.php', { method: 'DELETE', params: { id } }),
+  bulkDelete: (ids) => request('audit_log.php', { method: 'DELETE', params: { ids: ids.join(',') } }),
 };
 
 export { getToken, setToken, removeToken, getUser, setUser, ApiError };

@@ -1,6 +1,6 @@
 {
-  "name": "Love and Healing Management System",
-  "short_name": "Love and Healing System",
+  "name": "Love and Healing Management",
+  "short_name": "Love and Healing",
   "description": "Love and Healing Management System",
   "start_url": "/system/public/",
   "scope": "/system/",

@@ -1,7 +1,7 @@
 <?php
 require_once __DIR__ . '/config.php';
 $secret = $_GET['key'] ?? '';
-if ($secret !== 'lh-migrate-2026') { jsonResponse(['error' => 'Unauthorized'], 403); }
+if ($secret !== 'CHANGE_ME_CRON_KEY') { jsonResponse(['error' => 'Unauthorized'], 403); }
 $db = getDB();
 $results = [];
 try {

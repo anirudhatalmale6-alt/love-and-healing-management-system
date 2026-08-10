@@ -13,12 +13,12 @@
  *
  * Safe to run more than once (already-moved names are skipped).
  *
- * Run once:  /system/api/cleanup_business_people.php?key=lh-move-biz-2026
+ * Run once:  /system/api/cleanup_business_people.php?key=CHANGE_ME_CRON_KEY
  */
 
 require_once __DIR__ . '/config.php';
 
-if (($_GET['key'] ?? '') !== 'lh-move-biz-2026') {
+if (($_GET['key'] ?? '') !== 'CHANGE_ME_CRON_KEY') {
     http_response_code(403);
     exit('Forbidden');
 }

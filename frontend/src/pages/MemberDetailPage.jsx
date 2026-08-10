@@ -202,6 +202,7 @@ export default function MemberDetailPage() {
               {member.first_name?.charAt(0)}{member.last_name?.charAt(0)}
             </div>
             <h2 className="text-xl font-bold text-gray-900">{member.first_name} {member.last_name}</h2>
+            {member.function_title && <div className="mt-1 text-sm font-semibold text-amber-700">{member.function_title}</div>}
             <div className="mt-2">{statusBadge(member.status)}</div>
 
             <div className="mt-6 space-y-3 text-left">
@@ -243,6 +244,9 @@ export default function MemberDetailPage() {
                           title={g.department_name ? `Serves the ${g.department_name} department` : undefined}
                         >
                           {g.name}
+                          {g.function_title && (
+                            <span className="font-semibold text-amber-700">&middot; {g.function_title}</span>
+                          )}
                           {g.department_name && (
                             <span className="text-blue-600">&middot; {g.department_name}</span>
                           )}

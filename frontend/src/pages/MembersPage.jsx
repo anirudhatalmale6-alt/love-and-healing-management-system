@@ -21,6 +21,7 @@ const emptyMember = {
   baptism_date: '', salvation_date: '', first_visit_date: '',
   membership_class_date: '', dedication_date: '', wedding_date: '',
   card_title: '', card_expiry_date: '',
+  group_titles: {}, // per-group role, keyed by group id
 };
 
 const personTypeLabels = {
@@ -39,7 +40,10 @@ const personTypeColors = {
 };
 
 export default function MembersPage() {
-  const { isAdmin } = useAuth();
+  const { isAdmin, canEdit: globalCanEdit, hideSensitive, hasSectionAccess } = useAuth();
+  // Can add/edit People = not globally view-only AND allowed to edit this section.
+  const canEdit = globalCanEdit && hasSectionAccess('members', 'add_edit');
+  const canDelete = globalCanEdit && hasSectionAccess('members', 'delete');
   const [searchParams, setSearchParams] = useSearchParams();
   const [personTypes, setPersonTypes] = useState(DEFAULT_PERSON_TYPES);
   const [members, setMembers] = useState([]);
@@ -63,6 +67,9 @@ export default function MembersPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [deleteId, setDeleteId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   const [dupMatches, setDupMatches] = useState(null);
   const [availableGroups, setAvailableGroups] = useState([]);
   const [availableHouseholds, setAvailableHouseholds] = useState([]);
@@ -85,6 +92,7 @@ export default function MembersPage() {
       if (personTypeFilter) params.person_type = personTypeFilter;
       const data = await membersApi.list(params);
       setMembers(data.members);
+      setSelectedIds([]);
       setTotal(data.total);
       setPages(data.pages);
       setFamilyGroups(data.family_groups || []);
@@ -127,8 +135,16 @@ export default function MembersPage() {
     setShowModal(true);
   };
 
-  const openEdit = (member) => {
+  const openEdit = async (member) => {
     setEditMember(member);
+    // Pull the full record so we get each group's per-person role/title
+    let full = member;
+    try {
+      const res = await membersApi.get(member.id);
+      if (res && res.member) full = res.member;
+    } catch { /* fall back to the list row */ }
+    const groupTitles = {};
+    (full.groups || []).forEach(g => { groupTitles[Number(g.id)] = g.function_title || ''; });
     setForm({
       first_name: member.first_name || '',
       last_name: member.last_name || '',
@@ -142,7 +158,8 @@ export default function MembersPage() {
       zip: member.zip || '',
       gender: member.gender || '',
       date_of_birth: member.date_of_birth || '',
-      group_ids: (member.group_ids || []).map(Number),
+      group_ids: (full.group_ids || member.group_ids || []).map(Number),
+      group_titles: groupTitles,
       household_id: member.household_id || '',
       household_role: member.household_role || '',
       membership_date: member.membership_date || '',
@@ -197,6 +214,25 @@ export default function MembersPage() {
     }
   };
 
+  const toggleOne = (id) =>
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const allOnPageSelected = members.length > 0 && members.every(m => selectedIds.includes(m.id));
+  const toggleAll = () =>
+    setSelectedIds(allOnPageSelected ? [] : members.map(m => m.id));
+
+  const handleBulkDelete = async () => {
+    if (!selectedIds.length) return;
+    setBulkDeleting(true);
+    try {
+      await membersApi.bulkDelete(selectedIds);
+      setBulkOpen(false);
+      loadMembers();
+    } catch (err) {
+      alert(err.message);
+    }
+    setBulkDeleting(false);
+  };
+
   const statusBadge = (status) => {
     switch (status) {
       case 'active': return <span className="badge-green">Active</span>;
@@ -213,13 +249,19 @@ export default function MembersPage() {
   const toggleGroup = (groupId) => {
     setForm(f => {
       const current = f.group_ids || [];
+      const isOn = current.includes(groupId);
+      const titles = { ...(f.group_titles || {}) };
+      if (isOn) delete titles[groupId]; // leaving the group drops its role too
       return {
         ...f,
-        group_ids: current.includes(groupId)
-          ? current.filter(id => id !== groupId)
-          : [...current, groupId],
+        group_ids: isOn ? current.filter(id => id !== groupId) : [...current, groupId],
+        group_titles: titles,
       };
     });
+  };
+
+  const setGroupTitle = (groupId, value) => {
+    setForm(f => ({ ...f, group_titles: { ...(f.group_titles || {}), [groupId]: value } }));
   };
 
   const exportCSV = async () => {
@@ -254,15 +296,19 @@ export default function MembersPage() {
               <RefreshCw size={18} className={autoStatusRunning ? 'animate-spin' : ''} /> Auto-Status
             </button>
           )}
-          <button onClick={() => setShowImport(true)} className="btn-secondary">
-            <Upload size={18} /> Import
-          </button>
+          {canEdit && (
+            <button onClick={() => setShowImport(true)} className="btn-secondary">
+              <Upload size={18} /> Import
+            </button>
+          )}
           <button onClick={exportCSV} className="btn-secondary">
             <Download size={18} /> Export
           </button>
-          <button onClick={openNew} className="btn-primary">
-            <UserPlus size={18} /> Add Person
-          </button>
+          {canEdit && (
+            <button onClick={openNew} className="btn-primary">
+              <UserPlus size={18} /> Add Person
+            </button>
+          )}
         </div>
       </div>
 
@@ -291,15 +337,15 @@ export default function MembersPage() {
 
       {/* Filters */}
       <div className="card mb-6">
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="relative flex-1">
-            <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+        <div className="flex flex-col sm:flex-row sm:flex-wrap gap-3">
+          <div className="relative w-full sm:flex-1 sm:min-w-[220px]">
+            <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
             <input
               type="text"
               placeholder="Search people..."
               value={search}
               onChange={(e) => { setSearch(e.target.value); setPage(1); }}
-              className="input pl-10"
+              className="input pl-10 w-full"
             />
           </div>
           <select
@@ -348,6 +394,19 @@ export default function MembersPage() {
         </div>
       </div>
 
+      {/* Bulk action bar */}
+      {isAdmin && selectedIds.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4 px-4 py-3 rounded-lg bg-primary-50 border border-primary-200">
+          <span className="text-sm font-medium text-primary-800">{selectedIds.length} selected</span>
+          <div className="flex gap-2">
+            <button onClick={() => setSelectedIds([])} className="btn-secondary text-sm">Clear</button>
+            <button onClick={() => setBulkOpen(true)} className="btn-danger text-sm">
+              <Trash2 size={14} /> Delete selected
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Members Table */}
       <div className="card p-0 overflow-hidden">
         {loading ? (
@@ -368,8 +427,19 @@ export default function MembersPage() {
               <table className="w-full">
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
+                    {isAdmin && (
+                      <th className="px-4 py-3 w-10">
+                        <input
+                          type="checkbox"
+                          checked={allOnPageSelected}
+                          onChange={toggleAll}
+                          className="h-4 w-4 rounded border-gray-300 text-primary-700 focus:ring-primary-500 cursor-pointer"
+                          title="Select all on this page"
+                        />
+                      </th>
+                    )}
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Name</th>
-                    <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider hidden md:table-cell">Contact</th>
+                    {!hideSensitive && <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider hidden md:table-cell">Contact</th>}
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider hidden lg:table-cell">Group</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Type</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
@@ -378,22 +448,39 @@ export default function MembersPage() {
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {members.map(m => (
-                    <tr key={m.id} className="hover:bg-gray-50 transition-colors">
+                    <tr key={m.id} className={`transition-colors ${selectedIds.includes(m.id) ? 'bg-primary-50' : 'hover:bg-gray-50'}`}>
+                      {isAdmin && (
+                        <td className="px-4 py-3">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.includes(m.id)}
+                            onChange={() => toggleOne(m.id)}
+                            className="h-4 w-4 rounded border-gray-300 text-primary-700 focus:ring-primary-500 cursor-pointer"
+                          />
+                        </td>
+                      )}
                       <td className="px-4 py-3">
                         <Link to={`/system/public/members/${m.id}`} className="flex items-center gap-3">
                           <div className="w-9 h-9 bg-primary-700 rounded-full flex items-center justify-center text-white text-sm font-medium shrink-0">
                             {m.first_name?.charAt(0)}{m.last_name?.charAt(0)}
                           </div>
                           <div>
-                            <div className="font-medium text-gray-900">{m.first_name} {m.last_name}</div>
-                            <div className="text-xs text-gray-500 md:hidden">{m.phone || m.email}</div>
+                            <div className="font-medium text-gray-900">
+                              {sortBy === 'last_name'
+                                ? `${(m.last_name || '').trim()}, ${(m.first_name || '').trim()}`
+                                : `${m.first_name} ${m.last_name}`}
+                            </div>
+                            {m.function_title && <div className="text-xs font-medium text-primary-700">{m.function_title}</div>}
+                            {!hideSensitive && <div className="text-xs text-gray-500 md:hidden">{m.phone || m.email}</div>}
                           </div>
                         </Link>
                       </td>
-                      <td className="px-4 py-3 hidden md:table-cell">
-                        <div className="text-sm text-gray-700">{m.email || '-'}</div>
-                        <div className="text-xs text-gray-500">{m.phone || ''}</div>
-                      </td>
+                      {!hideSensitive && (
+                        <td className="px-4 py-3 hidden md:table-cell">
+                          <div className="text-sm text-gray-700">{m.email || '-'}</div>
+                          <div className="text-xs text-gray-500">{m.phone || ''}</div>
+                        </td>
+                      )}
                       <td className="px-4 py-3 hidden lg:table-cell text-sm text-gray-600">
                         {m.family_group || '-'}
                       </td>
@@ -408,14 +495,16 @@ export default function MembersPage() {
                           >
                             <Eye size={16} />
                           </Link>
-                          <button
-                            onClick={() => openEdit(m)}
-                            className="p-2 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded-lg"
-                            title="Edit"
-                          >
-                            <Edit2 size={16} />
-                          </button>
-                          {isAdmin && (
+                          {canEdit && (
+                            <button
+                              onClick={() => openEdit(m)}
+                              className="p-2 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded-lg"
+                              title="Edit"
+                            >
+                              <Edit2 size={16} />
+                            </button>
+                          )}
+                          {(isAdmin || canDelete) && (
                             <button
                               onClick={() => setDeleteId(m.id)}
                               className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg"
@@ -575,30 +664,43 @@ export default function MembersPage() {
             <div className="sm:col-span-2">
               <label className="label">Groups</label>
               {availableGroups.length > 0 ? (
-                <div className="border border-gray-200 rounded-lg p-2 grid grid-cols-1 sm:grid-cols-2 gap-1 max-h-52 overflow-y-auto">
+                <div className="border border-gray-200 rounded-lg p-2 grid grid-cols-1 sm:grid-cols-2 gap-1 max-h-72 overflow-y-auto">
                   {availableGroups.map(g => {
                     const selected = (form.group_ids || []).includes(g.id);
                     return (
-                      <label key={g.id} className={`flex items-start gap-2 p-1.5 rounded cursor-pointer transition-colors ${selected ? 'bg-primary-50' : 'hover:bg-gray-50'}`}>
-                        <input
-                          type="checkbox"
-                          checked={selected}
-                          onChange={() => toggleGroup(g.id)}
-                          className="mt-0.5 w-4 h-4 text-primary-700 rounded border-gray-300 focus:ring-primary-500"
-                        />
-                        <span className="min-w-0">
-                          <span className="block text-sm text-gray-700 truncate">{g.name}</span>
-                          {g.department_name && (
-                            <span className="block text-xs text-blue-600 truncate">serves {g.department_name}</span>
-                          )}
-                        </span>
-                      </label>
+                      <div key={g.id} className={`p-1.5 rounded transition-colors ${selected ? 'bg-primary-50' : 'hover:bg-gray-50'}`}>
+                        <label className="flex items-start gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => toggleGroup(g.id)}
+                            className="mt-0.5 w-4 h-4 text-primary-700 rounded border-gray-300 focus:ring-primary-500"
+                          />
+                          <span className="min-w-0">
+                            <span className="block text-sm text-gray-700 truncate">{g.name}</span>
+                            {g.department_name && (
+                              <span className="block text-xs text-blue-600 truncate">serves {g.department_name}</span>
+                            )}
+                          </span>
+                        </label>
+                        {selected && (
+                          <input
+                            className="input mt-1.5 py-1 text-sm"
+                            value={(form.group_titles || {})[g.id] || ''}
+                            onChange={e => setGroupTitle(g.id, e.target.value)}
+                            placeholder="Role in this group (optional)"
+                          />
+                        )}
+                      </div>
                     );
                   })}
                 </div>
               ) : (
                 <p className="text-xs text-gray-400 p-2 border border-gray-200 rounded-lg">No groups created yet. Create groups from the Groups page.</p>
               )}
+              <p className="text-xs text-gray-400 mt-1">
+                Tick the groups this person belongs to. Add a role (e.g. President, Vice-President) only where they hold one - people with a role show at the top of that group. Leave the role blank and they appear as a regular member there.
+              </p>
             </div>
             <div>
               <label className="label">Membership Date</label>
@@ -788,6 +890,19 @@ export default function MembersPage() {
           <button onClick={() => setDeleteId(null)} className="btn-secondary">Cancel</button>
           <button onClick={handleDelete} className="btn-danger">
             <Trash2 size={16} /> Delete
+          </button>
+        </div>
+      </Modal>
+
+      {/* Bulk Delete Confirmation */}
+      <Modal isOpen={bulkOpen} onClose={() => !bulkDeleting && setBulkOpen(false)} title="Delete Selected People" size="sm">
+        <p className="text-gray-600 mb-6">
+          Are you sure you want to delete {selectedIds.length} selected {selectedIds.length === 1 ? 'person' : 'people'}? This action cannot be undone and will also remove all their attendance records.
+        </p>
+        <div className="flex items-center justify-end gap-3">
+          <button onClick={() => setBulkOpen(false)} className="btn-secondary" disabled={bulkDeleting}>Cancel</button>
+          <button onClick={handleBulkDelete} className="btn-danger" disabled={bulkDeleting}>
+            <Trash2 size={16} /> {bulkDeleting ? 'Deleting...' : `Delete ${selectedIds.length}`}
           </button>
         </div>
       </Modal>

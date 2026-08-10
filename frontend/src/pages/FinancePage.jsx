@@ -1,18 +1,19 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import ReactDOM from 'react-dom';
-import { finance as financeApi, members as membersApi, services as servicesApi, auditLog as auditLogApi } from '../utils/api';
+import { finance as financeApi, members as membersApi, services as servicesApi, auditLog as auditLogApi, reports as reportsApi, settings as settingsApi } from '../utils/api';
 import { useAuth } from '../contexts/AuthContext';
 import { formatTime12h, downloadCSV, fmtServiceDate } from '../utils/format';
 import Modal from '../components/Modal';
 import Pagination from '../components/Pagination';
 import jsPDF from 'jspdf';
+import { loadPersonTypes, DEFAULT_PERSON_TYPES, labelFor } from '../utils/personTypes';
 import autoTable from 'jspdf-autotable';
 import {
   DollarSign, Plus, Edit2, Trash2, Check, X, AlertCircle,
   Download, FileText, Search, TrendingUp, PieChart,
   Calendar, CreditCard, Users, ChevronDown, ChevronUp,
   Printer, Settings, Tag, Eye, EyeOff, ShieldCheck, Receipt,
-  BarChart3, Wallet, BookOpen, ChevronRight, Landmark, Store
+  BarChart3, Wallet, BookOpen, ChevronRight, Landmark, Store, HandCoins
 } from 'lucide-react';
 
 const paymentMethods = [
@@ -46,6 +47,125 @@ function formatDate(dateStr) {
 
 function getServiceLabel(s) {
   return `${s.name} - ${fmtServiceDate(s.date)} ${formatTime12h(s.time)}`;
+}
+
+/* ─── Report Card document ───
+ * One shared HTML document drives BOTH the print view and the PDF, so the file the
+ * pastor saves is the same thing he sees on paper. The PDF is produced by rendering
+ * this markup (jsPDF + html2canvas) rather than re-drawing it with table code.
+ */
+const RC_STATUS_LABEL = { present: 'Present', late: 'Late', absent: 'Absent', not_recorded: 'Not recorded' };
+
+const rcEscape = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const rcLongDate = (d) => {
+  if (!d) return '';
+  const dt = new Date(String(d).length <= 10 ? d + 'T00:00:00' : d);
+  return isNaN(dt.getTime()) ? String(d)
+    : dt.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+};
+
+function reportCardStyles() {
+  return `
+  *{box-sizing:border-box;}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#1f2937;margin:0;padding:0;}
+  .card{width:720px;margin:0 auto;padding:34px 38px 40px;}
+  .card + .card{page-break-before:always;}
+  .letterhead{text-align:center;border-bottom:3px solid #4a2c17;padding-bottom:12px;margin-bottom:6px;}
+  .letterhead .church{font-size:22px;font-weight:800;letter-spacing:.3px;color:#4a2c17;}
+  .letterhead .addr{font-size:12.5px;color:#6b7280;margin-top:3px;}
+  .doctitle{text-align:center;font-size:17px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#4a2c17;margin:14px 0 4px;}
+  .period{text-align:center;font-size:12.5px;color:#6b7280;margin-bottom:18px;}
+  .who{background:#faf7f4;border:1px solid #e7ded6;border-radius:8px;padding:12px 14px;margin-bottom:16px;}
+  .who .nm{font-size:17px;font-weight:700;color:#1f2937;}
+  .who .sub{font-size:12.5px;color:#6b7280;margin-top:2px;}
+  h3{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:#4a2c17;margin:20px 0 7px;padding-bottom:4px;border-bottom:1px solid #e5e7eb;}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  th{text-align:left;padding:6px 8px;background:#f6f3f0;border-bottom:1px solid #e5e7eb;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;color:#6b7280;font-weight:700;}
+  td{padding:5px 8px;border-bottom:1px solid #f3f4f6;}
+  .r{text-align:right;}
+  .tot td{border-top:2px solid #4a2c17;border-bottom:none;font-weight:800;font-size:13.5px;padding-top:7px;}
+  .tiles{display:flex;gap:10px;margin-bottom:4px;}
+  .tile{flex:1;border:1px solid #e7ded6;border-radius:8px;padding:9px 11px;background:#faf7f4;}
+  .tile .lab{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#6b7280;}
+  .tile .val{font-size:17px;font-weight:800;color:#4a2c17;margin-top:1px;}
+  .present{color:#15803d;font-weight:700;} .absent{color:#b91c1c;font-weight:700;} .muted{color:#9ca3af;}
+  .note{border:1px solid #e7ded6;border-radius:8px;padding:11px 13px;background:#fffdf9;font-size:12.5px;white-space:pre-wrap;line-height:1.5;}
+  .foot{margin-top:26px;padding-top:9px;border-top:1px solid #e5e7eb;font-size:10.5px;color:#9ca3af;display:flex;justify-content:space-between;}
+  @media print{.card{width:auto;padding:16px 8px;} @page{margin:14mm;}}
+  `;
+}
+
+/** One person's card. `card` comes from buildReportCard(). */
+function reportCardBody(card, church, opts) {
+  const { showDetails } = opts;
+  const addr = [church.church_address, church.church_phone].filter(Boolean).join(' &nbsp;•&nbsp; ');
+
+  let giving = '';
+  if (card.includeGiving) {
+    const catRows = Object.entries(card.byCategory || {}).map(([cat, amt]) =>
+      `<tr><td>${rcEscape(cat)}</td><td class="r">${formatCurrency(amt)}</td></tr>`).join('');
+    const detailRows = (card.donations || []).map(d =>
+      `<tr><td>${rcLongDate(d.donation_date)}</td><td>${rcEscape(d.category_name)}</td>
+        <td>${rcEscape(d.payment_method)}</td><td class="r">${formatCurrency(d.amount)}</td></tr>`).join('');
+    giving = `<h3>Giving</h3>
+      ${showDetails && detailRows ? `<table><thead><tr><th>Date</th><th>Category</th><th>Method</th><th class="r">Amount</th></tr></thead><tbody>${detailRows}</tbody></table><div style="height:10px"></div>` : ''}
+      <table><tbody>${catRows || '<tr><td class="muted">No giving recorded in this period.</td><td class="r">—</td></tr>'}
+        <tr class="tot"><td>Total Giving</td><td class="r">${formatCurrency(card.givingTotal)}</td></tr></tbody></table>`;
+  }
+
+  let attendance = '';
+  if (card.includeAttendance) {
+    const rows = (card.services || []).map(s =>
+      `<tr><td>${rcLongDate(s.date)}</td><td>${rcEscape(s.service_name || s.type)}</td>
+        <td class="${s.status === 'present' || s.status === 'late' ? 'present' : s.status === 'absent' ? 'absent' : 'muted'}">${RC_STATUS_LABEL[s.status] || s.status}</td></tr>`).join('');
+    attendance = `<h3>Attendance &amp; Engagement</h3>
+      <div class="tiles">
+        <div class="tile"><div class="lab">Attended</div><div class="val">${card.attended}</div></div>
+        <div class="tile"><div class="lab">Missed</div><div class="val">${card.absent}</div></div>
+        <div class="tile"><div class="lab">Services</div><div class="val">${card.totalServices}</div></div>
+        <div class="tile"><div class="lab">Rate</div><div class="val">${card.rate === null ? '&mdash;' : card.rate + '%'}</div></div>
+      </div>
+      ${card.serviceFilterLabel ? `<div style="font-size:11.5px;color:#6b7280;margin:7px 0 3px;">Services included: ${rcEscape(card.serviceFilterLabel)}</div>` : ''}
+      ${showDetails ? (rows
+        ? `<table><thead><tr><th>Date</th><th>Service</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`
+        : '<p style="font-size:12.5px;color:#6b7280;">No services in this period.</p>') : ''}`;
+  }
+
+  let pledges = '';
+  if (card.includePledges && (card.pledgesBehind || []).length > 0) {
+    const rows = card.pledgesBehind.map(p =>
+      `<tr><td>${rcEscape(p.category_name)}</td><td class="r">${formatCurrency(p.expected_total)}</td>
+        <td class="r">${formatCurrency(p.total_paid)}</td><td class="r absent">${formatCurrency(p.behind_by)}</td></tr>`).join('');
+    pledges = `<h3>Pledge Balance</h3>
+      <table><thead><tr><th>Pledge</th><th class="r">Expected</th><th class="r">Paid</th><th class="r">Balance</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } else if (card.includePledges) {
+    pledges = `<h3>Pledge Balance</h3><p style="font-size:12.5px;color:#15803d;">On track — nothing behind schedule.</p>`;
+  }
+
+  const note = card.note && card.note.trim()
+    ? `<h3>Notes &amp; Comments</h3><div class="note">${rcEscape(card.note.trim())}</div>` : '';
+
+  return `<div class="card">
+    <div class="letterhead">
+      <div class="church">${rcEscape(church.church_name || 'Love and Healing')}</div>
+      ${addr ? `<div class="addr">${addr}</div>` : ''}
+    </div>
+    <div class="doctitle">Report Card</div>
+    <div class="period">${rcLongDate(card.dateFrom)} &nbsp;—&nbsp; ${rcLongDate(card.dateTo)}</div>
+    <div class="who">
+      <div class="nm">${rcEscape(card.name)}</div>
+      ${card.personType ? `<div class="sub">${rcEscape(card.personType)}</div>` : ''}
+    </div>
+    ${giving}${attendance}${pledges}${note}
+    <div class="foot"><span>${rcEscape(church.church_name || '')}</span><span>Generated ${rcLongDate(new Date().toISOString().slice(0, 10))}</span></div>
+  </div>`;
+}
+
+function reportCardDocument(cards, church, opts) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Report Card${cards.length === 1 ? ' - ' + rcEscape(cards[0].name) : 's'}</title>
+    <style>${reportCardStyles()}</style></head><body>${cards.map(c => reportCardBody(c, church, opts)).join('')}</body></html>`;
 }
 
 function generatePDF(title, headers, rows, filename, summaryLines) {
@@ -241,6 +361,7 @@ export default function FinancePage() {
     { key: 'budgets', label: 'Budgets', icon: BarChart3, show: hasFullFinance && hasFinanceSection('budgets') },
     { key: 'financial_statements', label: 'Fin. Statements', icon: Wallet, show: hasReports && (hasFinanceSection('financial_statements') || hasFinanceSection('income_statement') || hasFinanceSection('balance_sheet') || hasFinanceSection('budget_actual')) },
     { key: 'pledges', label: 'Pledges', icon: Calendar, show: hasGiving && hasFinanceSection('pledges') },
+    { key: 'loans', label: 'Loans', icon: HandCoins, show: hasFullFinance && hasFinanceSection('loans') },
     { key: 'accounts', label: 'Chart of Accounts', icon: BookOpen, show: hasFullFinance && hasFinanceSection('accounts') },
     { key: 'vendors', label: 'Vendors', icon: Store, show: (hasExpenses || hasGiving) && hasFinanceSection('vendors') },
     { key: 'audit', label: 'Activity Log', icon: Eye, show: hasFullFinance && hasFinanceSection('audit') },
@@ -295,6 +416,7 @@ export default function FinancePage() {
       {tab === 'budgets' && <BudgetsTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
       {tab === 'financial_statements' && <FinancialStatementsTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} hasFinanceSection={hasFinanceSection} />}
       {tab === 'pledges' && <PledgesTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
+      {tab === 'loans' && <LoansTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
       {tab === 'accounts' && <ChartOfAccountsTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
       {tab === 'vendors' && <VendorsTab setError={setError} setMessage={setMessage} />}
       {tab === 'audit' && <AuditLogTab setError={setError} setMessage={setMessage} isAdmin={isAdmin} />}
@@ -769,7 +891,7 @@ function RecordGivingTab({ setError, setMessage }) {
                       <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell max-w-xs truncate" title={d.notes || ''}>{d.notes || '-'}</td>
                       <td className="px-4 py-2">
                         <div className="flex items-center justify-end gap-1">
-                          <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
+                          <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date, deposit_to: d.routed_account_id || '' }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
                           <button onClick={() => setDeleteId(d.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
                         </div>
                       </td>
@@ -790,7 +912,7 @@ function RecordGivingTab({ setError, setMessage }) {
                     <div className="text-right">
                       <div className="text-sm font-semibold text-green-700">{formatCurrency(d.amount)}</div>
                       <div className="flex items-center gap-1 mt-1 justify-end">
-                        <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
+                        <button onClick={() => { setEditDonation(d); setEditForm({ member_id: d.member_id || '', donor_name: d.donor_name || '', amount: d.amount, category_id: d.category_id, payment_method: d.payment_method, notes: d.notes || '', donation_date: d.donation_date, deposit_to: d.routed_account_id || '' }); }} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded"><Edit2 size={14} /></button>
                         <button onClick={() => setDeleteId(d.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
                       </div>
                     </div>
@@ -810,11 +932,19 @@ function RecordGivingTab({ setError, setMessage }) {
 
       <Modal isOpen={!!editDonation} onClose={() => setEditDonation(null)} title="Edit Donation" size="sm">
         <div className="space-y-4">
-          <div><label className="label">Name</label><MemberTypeahead membersList={membersList} vendorList={vendorList} value={editForm.member_id || ''} donorName={editForm.donor_name || ''} onChange={val => setEditForm(f => ({ ...f, member_id: val, donor_name: val ? '' : f.donor_name }))} onDonorNameChange={val => setEditForm(f => ({ ...f, donor_name: val, member_id: '' }))} onAddNew={() => { membersApi.list({ limit: 9999, sort: 'last_name' }).then(d => setMembersList(d.members || [])); financeApi.vendors().then(d => setVendorList(d.vendors || [])).catch(() => {}); }} /></div>
+          <div><label className="label">Name</label><MemberTypeahead membersList={membersList} vendorList={vendorList} value={editForm.member_id || ''} donorName={editForm.donor_name || ''} onChange={val => setEditForm(f => ({ ...f, member_id: val, donor_name: val ? '' : f.donor_name }))} onDonorNameChange={val => setEditForm(f => ({ ...f, donor_name: val, member_id: val ? '' : f.member_id }))} onAddNew={() => { membersApi.list({ limit: 9999, sort: 'last_name' }).then(d => setMembersList(d.members || [])); financeApi.vendors().then(d => setVendorList(d.vendors || [])).catch(() => {}); }} /></div>
           <div><label className="label">Amount ($)</label><input type="number" step="0.01" className="input" value={editForm.amount || ''} onChange={e => setEditForm(f => ({ ...f, amount: e.target.value }))} /></div>
           <div><label className="label">Category</label><select className="input" value={editForm.category_id || ''} onChange={e => setEditForm(f => ({ ...f, category_id: e.target.value }))}>{categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <div><label className="label">Method</label><select className="input" value={editForm.payment_method || 'cash'} onChange={e => setEditForm(f => ({ ...f, payment_method: e.target.value }))}>{paymentMethods.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}</select></div>
           <div><label className="label">Date</label><input type="date" className="input" value={editForm.donation_date || ''} onChange={e => setEditForm(f => ({ ...f, donation_date: e.target.value }))} /></div>
+          <div>
+            <label className="label">Deposit To</label>
+            <select className="input" value={editForm.deposit_to || ''} onChange={e => setEditForm(f => ({ ...f, deposit_to: e.target.value }))}>
+              <option value="">Not deposited to an account</option>
+              {bankAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+            <p className="text-xs text-gray-400 mt-1">Which bank account this money lands in. Changing it moves the amount to the new account.</p>
+          </div>
           <div><label className="label">Notes</label><input className="input" placeholder="Notes" value={editForm.notes || ''} onChange={e => setEditForm(f => ({ ...f, notes: e.target.value }))} /></div>
           <div className="flex justify-end gap-3 pt-2">
             <button onClick={() => setEditDonation(null)} className="btn-secondary">Cancel</button>
@@ -1465,9 +1595,15 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
   const [showCols, setShowCols] = useState({ type: true, description: true, method: true, account: true, status: true, by: true });
   const toggleCol = (col) => setShowCols(prev => ({ ...prev, [col]: !prev[col] }));
 
+  const [bankAccounts, setBankAccounts] = useState([]);
+  const [transferAccounts, setTransferAccounts] = useState([]);
+
   useEffect(() => {
     financeApi.categories().then(d => setCategories(d.categories || []));
     financeApi.expenseCategories().then(d => setExpCategories(d.categories || []));
+    financeApi.accounts('asset').then(d => setBankAccounts((d.accounts || []).filter(a => a.parent_id && parseInt(a.child_count) === 0))).catch(() => {});
+    // Accounts a transfer can move money between (leaf asset/liability/equity accounts).
+    financeApi.accounts().then(d => setTransferAccounts((d.accounts || []).filter(a => a.parent_id && parseInt(a.child_count) === 0 && ['asset', 'liability', 'equity'].includes(a.account_type)))).catch(() => {});
   }, []);
 
   const loadEntries = useCallback(async () => {
@@ -1492,9 +1628,18 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
   const openEdit = async (e) => {
     setEditItem(e);
     if (e.source === 'donation') {
-      setEditForm({ amount: e.amount, payment_method: e.method, notes: e.notes || '' });
+      setEditForm({ amount: e.amount, payment_method: e.method, notes: e.notes || '', deposit_to: e.routed_account_id || '' });
     } else if (e.source === 'expense') {
       setEditForm({ amount: e.amount, payment_method: e.method, description: e.notes || '' });
+    } else if (e.source === 'transfer') {
+      setEditForm({
+        amount: e.amount,
+        transfer_date: e.date,
+        from_account_id: e.from_account_id || '',
+        to_account_id: e.to_account_id || '',
+        notes: e.notes || '',
+        reference_number: e.reference_number || '',
+      });
     } else if (e.source === 'loan') {
       // A loan lives on two accounts at once, so pull both sides before editing.
       setEditForm({ amount: e.amount, transaction_date: e.date, description: e.description || '', loading: true });
@@ -1522,6 +1667,17 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
         await financeApi.update(editItem.id, editForm);
       } else if (editItem.source === 'expense') {
         await financeApi.updateExpense(editItem.id, editForm);
+      } else if (editItem.source === 'transfer') {
+        if (!editForm.from_account_id || !editForm.to_account_id) { setError('Please choose both accounts'); setEditSaving(false); return; }
+        if (editForm.from_account_id === editForm.to_account_id) { setError('Cannot transfer to the same account'); setEditSaving(false); return; }
+        await financeApi.updateTransfer(editItem.id, {
+          from_account_id: editForm.from_account_id,
+          to_account_id: editForm.to_account_id,
+          amount: editForm.amount,
+          transfer_date: editForm.transfer_date,
+          notes: editForm.notes,
+          reference_number: editForm.reference_number,
+        });
       } else if (editItem.source === 'loan') {
         await financeApi.updateLoanTransaction(editItem.id, {
           amount: editForm.amount,
@@ -1684,7 +1840,10 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
                     <tr key={`${e.source}-${e.id}`} className="hover:bg-gray-50">
                       <td className="px-4 py-2 text-sm text-gray-600">{formatDate(e.date)}</td>
                       {showCols.type && <td className="px-4 py-2"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${typeColors[e.type]}`}>{e.type}</span></td>}
-                      {showCols.description && <td className="px-4 py-2 text-sm text-gray-700 max-w-[250px] truncate">{e.description}</td>}
+                      {showCols.description && <td className="px-4 py-2 text-sm text-gray-700 max-w-[250px]">
+                        <div className="truncate">{e.description}</div>
+                        {e.notes && e.notes !== e.description && <div className="truncate text-xs text-gray-400 italic" title={e.notes}>{e.notes}</div>}
+                      </td>}
                       <td className={`px-4 py-2 text-sm text-right font-semibold ${e.type === 'Income' ? 'text-green-700' : e.type === 'Expense' ? 'text-red-700' : 'text-blue-700'}`}>{formatCurrency(e.amount)}</td>
                       {showCols.method && <td className="px-4 py-2 text-sm text-gray-500 hidden md:table-cell capitalize">{paymentMethodLabel[e.method] || e.method || '-'}</td>}
                       {showCols.account && <td className="px-4 py-2 text-sm text-gray-500 hidden lg:table-cell">{e.account || '-'}</td>}
@@ -1701,9 +1860,7 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
                           {isAdmin && e.source === 'expense' && e.status !== 'approved' && (
                             <button onClick={() => handleApprove(e)} className="p-1.5 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded" title="Approve"><ShieldCheck size={14} /></button>
                           )}
-                          {e.source !== 'transfer' && (
-                            <button onClick={() => openEdit(e)} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded" title="Edit"><Edit2 size={14} /></button>
-                          )}
+                          <button onClick={() => openEdit(e)} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded" title="Edit"><Edit2 size={14} /></button>
                           {isAdmin && (
                             <button onClick={() => setDeleteItem(e)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded" title="Delete"><Trash2 size={14} /></button>
                           )}
@@ -1751,10 +1908,69 @@ function HistoryTab({ setError, setMessage, isAdmin }) {
                 and the balances are corrected automatically.
               </p>
             </>
+          ) : editItem?.source === 'transfer' ? (
+            <>
+              <div>
+                <label className="label">From Account</label>
+                <select className="input" value={editForm.from_account_id || ''}
+                  onChange={e => setEditForm(f => ({ ...f, from_account_id: e.target.value }))}>
+                  <option value="">Select account...</option>
+                  {transferAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="label">To Account</label>
+                <select className="input" value={editForm.to_account_id || ''}
+                  onChange={e => setEditForm(f => ({ ...f, to_account_id: e.target.value }))}>
+                  <option value="">Select account...</option>
+                  {transferAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="label">Amount ($)</label>
+                <input type="number" step="0.01" className="input" value={editForm.amount || ''}
+                  onChange={e => setEditForm(f => ({ ...f, amount: e.target.value }))} />
+              </div>
+              <div>
+                <label className="label">Date</label>
+                <input type="date" className="input" value={editForm.transfer_date || ''}
+                  onChange={e => setEditForm(f => ({ ...f, transfer_date: e.target.value }))} />
+              </div>
+              <div>
+                <label className="label">Notes</label>
+                <input className="input" placeholder="Transfer notes" value={editForm.notes || ''}
+                  onChange={e => setEditForm(f => ({ ...f, notes: e.target.value }))} />
+              </div>
+              <p className="text-xs text-gray-500">
+                Both account balances are corrected automatically when you save.
+              </p>
+            </>
           ) : (
             <>
               <div><label className="label">Amount ($)</label><input type="number" step="0.01" className="input" value={editForm.amount || ''} onChange={e => setEditForm(f => ({ ...f, amount: e.target.value }))} /></div>
               <div><label className="label">Method</label><select className="input" value={editForm.payment_method || ''} onChange={e => setEditForm(f => ({ ...f, payment_method: e.target.value }))}>{paymentMethods.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}</select></div>
+              {editItem?.source === 'donation' && (
+                <div>
+                  <label className="label">Deposit To</label>
+                  <select className="input" value={editForm.deposit_to || ''} onChange={e => setEditForm(f => ({ ...f, deposit_to: e.target.value }))}>
+                    <option value="">Not deposited to an account</option>
+                    {bankAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                  <p className="text-xs text-gray-400 mt-1">Which bank account this money lands in. Changing it moves the amount to the new account.</p>
+                </div>
+              )}
+              {editItem?.source === 'donation' && (
+                <div>
+                  <label className="label">Notes</label>
+                  <input className="input" placeholder="Notes" value={editForm.notes || ''} onChange={e => setEditForm(f => ({ ...f, notes: e.target.value }))} />
+                </div>
+              )}
+              {editItem?.source === 'expense' && (
+                <div>
+                  <label className="label">Description / Notes</label>
+                  <input className="input" placeholder="Description or notes" value={editForm.description || ''} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))} />
+                </div>
+              )}
             </>
           )}
           <div className="flex justify-end gap-3 pt-2">
@@ -2090,7 +2306,26 @@ function StatementsTab({ setError }) {
   const [loading, setLoading] = useState(false);
   const [sortBy, setSortBy] = useState('name');
   const [includePledges, setIncludePledges] = useState(false);
+  const [includeEngagement, setIncludeEngagement] = useState(false);
+  const [engagement, setEngagement] = useState(null);
+
+  // --- Report Cards (several people at once) ---
+  const [rcIds, setRcIds] = useState([]);
+  const [rcSearch, setRcSearch] = useState('');
+  const [rcShowDetails, setRcShowDetails] = useState(true);
+  const [rcGiving, setRcGiving] = useState(true);
+  const [rcAttendance, setRcAttendance] = useState(true);
+  const [rcPledges, setRcPledges] = useState(false);
+  const [rcServiceTypes, setRcServiceTypes] = useState([]); // empty = every service
+  const [rcNotes, setRcNotes] = useState({});
+  const [rcCards, setRcCards] = useState(null);
+  const [rcBusy, setRcBusy] = useState(false);
+  const [church, setChurch] = useState({ church_name: 'Love and Healing' });
+  const [personTypes, setPersonTypes] = useState(DEFAULT_PERSON_TYPES);
+
   const stFreqLabel = { weekly: 'Weekly', monthly: 'Monthly', quarterly: 'Quarterly', annually: 'Annually' };
+  const stSvcLabel = { sunday_1st: '1st Sunday Service', sunday_2nd: '2nd Sunday Service', bible_study: 'Bible Study', fasting: 'Fasting & Prayer', special: 'Special Event' };
+  const stStatusLabel = { present: 'Present', late: 'Late', absent: 'Absent', not_recorded: 'Not recorded' };
 
   const catParam = catIds.join(',');
   const catLabel = catIds.length === 0
@@ -2102,7 +2337,141 @@ function StatementsTab({ setError }) {
     financeApi.statementDonors().then(d => setDonorsList(d.donors || [])).catch(() => {});
     financeApi.vendors().then(d => setVendorsList(d.vendors || [])).catch(() => {});
     financeApi.categories().then(d => setCategories((d.categories || []).filter(c => c.is_active == null || Number(c.is_active) === 1))).catch(() => {});
+    settingsApi.get().then(d => setChurch(d.settings || d || {})).catch(() => {});
+    loadPersonTypes().then(setPersonTypes).catch(() => {});
   }, []);
+
+  const RC_SERVICE_TYPES = [
+    { key: 'sunday_1st', label: '1st Sunday Service' },
+    { key: 'sunday_2nd', label: '2nd Sunday Service' },
+    { key: 'bible_study', label: 'Bible Study' },
+    { key: 'fasting', label: 'Fasting & Prayer' },
+    { key: 'special', label: 'Special Event' },
+  ];
+  const rcServiceLabel = rcServiceTypes.length === 0
+    ? 'All services'
+    : RC_SERVICE_TYPES.filter(t => rcServiceTypes.includes(t.key)).map(t => t.label).join(', ');
+
+  const toggleRcId = (id) => setRcIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const toggleRcServiceType = (k) => setRcServiceTypes(prev => prev.includes(k) ? prev.filter(x => x !== k) : [...prev, k]);
+
+  const rcFilteredPeople = membersList.filter(m => {
+    if (!rcSearch.trim()) return true;
+    return `${m.first_name} ${m.last_name}`.toLowerCase().includes(rcSearch.trim().toLowerCase());
+  });
+
+  // Pull each selected person's giving + attendance for the period and fold it into
+  // one card. Attendance totals are recomputed from the services actually shown, so
+  // the numbers always agree with the rows underneath them.
+  const buildReportCards = async () => {
+    if (rcIds.length === 0) { setError('Pick at least one person'); return; }
+    setRcBusy(true); setError('');
+    try {
+      const cards = [];
+      for (const id of rcIds) {
+        const person = membersList.find(m => String(m.id) === String(id));
+        const name = person ? `${person.first_name} ${person.last_name}`.trim() : `#${id}`;
+        let stmt = null, eng = null;
+        if (rcGiving || rcPledges) {
+          try { stmt = await financeApi.memberStatement(id, dateFrom, dateTo, catParam, ''); } catch { stmt = null; }
+        }
+        if (rcAttendance) {
+          try { eng = await reportsApi.engagementMember(id, '12', '', dateFrom, dateTo); } catch { eng = null; }
+        }
+        const services = ((eng && eng.services) || [])
+          .filter(s => rcServiceTypes.length === 0 || rcServiceTypes.includes(s.type));
+        const attended = services.filter(s => s.status === 'present' || s.status === 'late').length;
+        const absent = services.filter(s => s.status === 'absent').length;
+        const counted = attended + absent;
+        cards.push({
+          id, name,
+          personType: person ? labelFor(personTypes, person.person_type) : '',
+          dateFrom, dateTo,
+          includeGiving: rcGiving, includeAttendance: rcAttendance, includePledges: rcPledges,
+          donations: (stmt && stmt.donations) || [],
+          byCategory: (stmt && stmt.total_by_category) || {},
+          givingTotal: (stmt && stmt.grand_total) || 0,
+          pledgesBehind: (stmt && stmt.pledges_behind) || [],
+          services, attended, absent,
+          totalServices: services.length,
+          // With nothing recorded, a "0%" would read as though they never came.
+          rate: counted > 0 ? Math.round((attended / counted) * 1000) / 10 : null,
+          counted,
+          serviceFilterLabel: rcServiceTypes.length === 0 ? '' : rcServiceLabel,
+          note: rcNotes[id] || '',
+        });
+      }
+      setRcCards(cards);
+    } catch (err) { setError(err.message); }
+    setRcBusy(false);
+  };
+
+  // Print and PDF share one document, so what he saves matches what he prints.
+  const rcCurrentCards = () => (rcCards || []).map(c => ({ ...c, note: rcNotes[c.id] || c.note }));
+
+  const printReportCards = () => {
+    const cards = rcCurrentCards();
+    if (!cards.length) return;
+    const html = reportCardDocument(cards, church, { showDetails: rcShowDetails });
+    const win = window.open('', '_blank');
+    if (win) { win.document.write(html); win.document.close(); win.focus(); setTimeout(() => win.print(), 350); }
+  };
+
+  const downloadReportCardsPDF = async () => {
+    const cards = rcCurrentCards();
+    if (!cards.length) return;
+    setRcBusy(true);
+    try {
+      // Pulled in on demand so the heavy renderer never weighs down page load.
+      const { default: html2canvas } = await import('html2canvas');
+      const holder = document.createElement('div');
+      holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:720px;background:#fff;';
+      holder.innerHTML = `<style>${reportCardStyles()}</style>` +
+        cards.map(c => reportCardBody(c, church, { showDetails: rcShowDetails })).join('');
+      document.body.appendChild(holder);
+      const doc = new jsPDF({ unit: 'pt', format: 'letter' });
+      const PAGE_W = doc.internal.pageSize.getWidth();
+      const PAGE_H = doc.internal.pageSize.getHeight();
+      const MARGIN = 24;
+      const usableW = PAGE_W - MARGIN * 2;
+      const cardEls = Array.from(holder.querySelectorAll('.card'));
+      for (let i = 0; i < cardEls.length; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        const canvas = await html2canvas(cardEls[i], { scale: 2, backgroundColor: '#ffffff', logging: false });
+        const scale = usableW / canvas.width;          // px -> pt
+        const fullH = canvas.height * scale;
+        const maxH = PAGE_H - MARGIN * 2;
+        if (i > 0) doc.addPage();
+        if (fullH <= maxH) {
+          doc.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', MARGIN, MARGIN, usableW, fullH);
+        } else if (fullH <= maxH * 1.4) {
+          // Only a little over: shrink it so the person still gets a single sheet,
+          // which is the whole point of a report card.
+          const s2 = maxH / canvas.height;
+          const w = canvas.width * s2;
+          doc.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', MARGIN + (usableW - w) / 2, MARGIN, w, maxH);
+        } else {
+          // Genuinely long (a big period with every detail): slice across pages.
+          const sliceH = Math.floor(maxH / scale); // in canvas px
+          for (let y = 0, first = true; y < canvas.height; y += sliceH, first = false) {
+            const h = Math.min(sliceH, canvas.height - y);
+            const part = document.createElement('canvas');
+            part.width = canvas.width; part.height = h;
+            part.getContext('2d').drawImage(canvas, 0, y, canvas.width, h, 0, 0, canvas.width, h);
+            if (!first) doc.addPage();
+            doc.addImage(part.toDataURL('image/jpeg', 0.92), 'JPEG', MARGIN, MARGIN, usableW, h * scale);
+          }
+        }
+      }
+      document.body.removeChild(holder);
+      doc.save(cards.length === 1
+        ? `report-card-${cards[0].name.replace(/\s+/g, '-')}.pdf`
+        : `report-cards-${cards.length}-people.pdf`);
+    } catch (err) {
+      setError('Could not build the PDF: ' + (err.message || err));
+    }
+    setRcBusy(false);
+  };
 
   const toggleCat = (id) => {
     const n = Number(id);
@@ -2117,6 +2486,15 @@ function StatementsTab({ setError }) {
       try {
         const data = await financeApi.memberStatement(selectedMemberId, dateFrom, dateTo, catParam, selectedDonorName);
         setStatement(data);
+        // Optionally pull this person's attendance/engagement for the SAME period.
+        if (includeEngagement && selectedMemberId) {
+          try {
+            const eng = await reportsApi.engagementMember(selectedMemberId, '12', '', dateFrom, dateTo);
+            setEngagement(eng);
+          } catch { setEngagement(null); }
+        } else {
+          setEngagement(null);
+        }
       } catch (err) {
         setError(err.message);
       }
@@ -2258,6 +2636,23 @@ function StatementsTab({ setError }) {
       }
     }
 
+    let engagementSection = '';
+    if (includeEngagement && engagement) {
+      const engRows = (engagement.services || []).map(s => {
+        const date = new Date(s.date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const label = stStatusLabel[s.status] || s.status;
+        const color = (s.status === 'present' || s.status === 'late') ? '#15803d' : s.status === 'absent' ? '#b91c1c' : '#9ca3af';
+        return `<tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${date}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">${s.service_name || stSvcLabel[s.type] || s.type}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;color:${color};font-weight:600;">${label}</td>
+        </tr>`;
+      }).join('');
+      engagementSection = `<h3 style="margin-top:24px;font-size:16px;color:#4338ca;">Attendance &amp; Engagement</h3>
+        <div style="font-size:14px;margin-bottom:8px;">Attended ${engagement.attended} of ${engagement.total_services} services &nbsp;·&nbsp; Missed ${engagement.absent} &nbsp;·&nbsp; Rate ${engagement.attendance_rate}%</div>
+        ${engRows ? `<table><thead><tr><th>Date</th><th>Service</th><th>Status</th></tr></thead><tbody>${engRows}</tbody></table>` : '<p style="font-size:13px;color:#6b7280;">No services in this period.</p>'}`;
+    }
+
     const html = `<!DOCTYPE html><html><head><title>Giving Statement - ${fullName}</title>
     <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:40px;color:#1f2937;max-width:800px;margin:0 auto;}
     h1{font-size:22px;margin-bottom:4px;} .meta{color:#6b7280;font-size:14px;margin-bottom:20px;}
@@ -2280,6 +2675,7 @@ function StatementsTab({ setError }) {
     <tr style="border-top:2px solid #1f2937;"><td style="padding:8px 10px;" class="total-row">Grand Total</td><td style="padding:8px 10px;text-align:right;" class="total-row">${formatCurrency(statement.grand_total)}</td></tr>
     </tbody></table>
     ${pledgeSection}
+    ${engagementSection}
     <p style="margin-top:30px;font-size:12px;color:#9ca3af;">This statement is provided for your records. Thank you for your generous giving!</p>
     </body></html>`;
 
@@ -2306,6 +2702,11 @@ function StatementsTab({ setError }) {
       } else {
         extraLines.push('Pledges: on track - nothing behind schedule.');
       }
+    }
+    if (includeEngagement && engagement) {
+      extraLines.push('--- Attendance & Engagement ---');
+      extraLines.push(`Attended ${engagement.attended} of ${engagement.total_services} services | Missed ${engagement.absent} | Rate ${engagement.attendance_rate}%`);
+      (engagement.services || []).forEach(s => extraLines.push(`${s.date} - ${s.service_name || stSvcLabel[s.type] || s.type}: ${stStatusLabel[s.status] || s.status}`));
     }
     generatePDF(
       `Giving Statement - ${fullName}`,
@@ -2411,6 +2812,12 @@ function StatementsTab({ setError }) {
           >
             Vendor
           </button>
+          <button
+            onClick={() => { setMode('report_card'); setStatement(null); setAllStatement(null); setNonGivers(null); setVendorStatement(null); }}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${mode === 'report_card' ? 'bg-primary-700 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+          >
+            Report Cards
+          </button>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           {mode === 'individual' && (
@@ -2453,6 +2860,7 @@ function StatementsTab({ setError }) {
             </div>
           )}
           {mode === 'non_givers' && <div className="sm:col-span-2" />}
+          {mode === 'report_card' && <div className="sm:col-span-2" />}
           <div>
             <label className="label">From</label>
             <input type="date" className="input" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
@@ -2463,7 +2871,79 @@ function StatementsTab({ setError }) {
           </div>
         </div>
 
-        {mode !== 'vendor' && (
+        {mode === 'report_card' && (
+          <div className="mt-4 space-y-4">
+            {/* Who the cards are for - tick as many people as you like */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="label mb-0">People ({rcIds.length} selected)</label>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setRcIds(rcFilteredPeople.map(m => m.id))} className="text-xs font-medium text-primary-700 hover:underline">Select all shown</button>
+                  <button type="button" onClick={() => setRcIds([])} className="text-xs font-medium text-gray-500 hover:underline">Clear</button>
+                </div>
+              </div>
+              <input className="input mb-2" placeholder="Search a name..." value={rcSearch} onChange={e => setRcSearch(e.target.value)} />
+              <div className="border border-gray-200 rounded-lg max-h-52 overflow-y-auto divide-y divide-gray-100">
+                {rcFilteredPeople.length === 0 && <div className="px-3 py-4 text-sm text-gray-400">No one matches that search.</div>}
+                {rcFilteredPeople.map(m => (
+                  <label key={m.id} className={`flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer ${rcIds.includes(m.id) ? 'bg-primary-50' : 'hover:bg-gray-50'}`}>
+                    <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500"
+                      checked={rcIds.includes(m.id)} onChange={() => toggleRcId(m.id)} />
+                    <span className="text-gray-800">{m.last_name}, {m.first_name}</span>
+                    <span className="text-xs text-gray-400 ml-auto">{labelFor(personTypes, m.person_type)}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Which services count - 1st Sunday and 2nd Sunday crowds differ */}
+            <div>
+              <label className="label">Services to include</label>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={() => setRcServiceTypes([])}
+                  className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${rcServiceTypes.length === 0 ? 'bg-primary-700 text-white border-primary-700' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}>
+                  All services
+                </button>
+                {RC_SERVICE_TYPES.map(t => (
+                  <button key={t.key} type="button" onClick={() => toggleRcServiceType(t.key)}
+                    className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${rcServiceTypes.includes(t.key) ? 'bg-primary-700 text-white border-primary-700' : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'}`}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-gray-400 mt-1">Pick one or more if you only want certain services counted — the attended / missed / rate figures are worked out from just those.</p>
+            </div>
+
+            {/* What goes on the card */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
+                <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500" checked={rcGiving} onChange={e => setRcGiving(e.target.checked)} />
+                Include giving
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
+                <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500" checked={rcAttendance} onChange={e => setRcAttendance(e.target.checked)} />
+                Include attendance &amp; engagement
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
+                <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500" checked={rcPledges} onChange={e => setRcPledges(e.target.checked)} />
+                Include pledge balance
+              </label>
+              <label className="flex items-center gap-2 text-sm font-medium text-gray-800 cursor-pointer select-none">
+                <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500" checked={rcShowDetails} onChange={e => setRcShowDetails(e.target.checked)} />
+                Show the details (untick for totals only)
+              </label>
+            </div>
+
+            <div>
+              <button onClick={buildReportCards} disabled={rcBusy || rcIds.length === 0} className="btn-primary">
+                {rcBusy ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <FileText size={16} />}
+                Generate {rcIds.length > 1 ? `${rcIds.length} Report Cards` : 'Report Card'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {mode !== 'vendor' && mode !== 'report_card' && (
         <div className="mt-4">
           <label className="label">Filter by Account / Category</label>
           <div className="flex flex-wrap gap-2">
@@ -2492,13 +2972,68 @@ function StatementsTab({ setError }) {
             Include this member's pledge balance behind schedule on the statement
           </label>
         )}
+        {mode === 'individual' && selectedMemberId && !selectedDonorName && (
+          <label className="mt-2 flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
+            <input type="checkbox" className="rounded border-gray-300 text-primary-700 focus:ring-primary-500"
+              checked={includeEngagement} onChange={e => setIncludeEngagement(e.target.checked)} />
+            Include this person's attendance &amp; engagement for the same period
+          </label>
+        )}
+        {mode !== 'report_card' && (
         <div className="mt-4">
           <button onClick={loadStatement} disabled={loading} className="btn-primary">
             {loading ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <FileText size={16} />}
             Generate Statement
           </button>
         </div>
+        )}
       </div>
+
+      {/* Report Cards result */}
+      {mode === 'report_card' && rcCards && rcCards.length > 0 && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div>
+              <h2 className="text-lg font-bold text-gray-900">{rcCards.length} Report Card{rcCards.length !== 1 ? 's' : ''}</h2>
+              <p className="text-sm text-gray-500">
+                {rcLongDate(dateFrom)} - {rcLongDate(dateTo)} | {rcServiceLabel} | {rcShowDetails ? 'with details' : 'totals only'}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={downloadReportCardsPDF} disabled={rcBusy} className="btn-secondary">
+                {rcBusy ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600" /> : <Download size={16} />} PDF
+              </button>
+              <button onClick={printReportCards} className="btn-secondary"><Printer size={16} /> Print</button>
+            </div>
+          </div>
+
+          <p className="text-xs text-gray-500 mb-3">
+            Add a note for anyone below and it appears on their card. The PDF is built from the same page as the print-out, so they look identical.
+          </p>
+
+          <div className="space-y-3">
+            {rcCards.map(c => (
+              <div key={c.id} className="border border-gray-200 rounded-lg p-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="font-medium text-gray-900">{c.name}
+                    {c.personType && <span className="ml-2 text-xs text-gray-400">{c.personType}</span>}
+                  </div>
+                  <div className="text-sm text-gray-600 flex gap-4">
+                    {c.includeGiving && <span>Giving <strong className="text-gray-800">{formatCurrency(c.givingTotal)}</strong></span>}
+                    {c.includeAttendance && <span>Attended <strong className="text-gray-800">{c.attended}/{c.totalServices}</strong> ({c.rate === null ? 'not recorded' : c.rate + '%'})</span>}
+                  </div>
+                </div>
+                <textarea
+                  className="input mt-2 text-sm" rows={2}
+                  placeholder={`Note or comment for ${c.name} (optional) - appears on the card`}
+                  value={rcNotes[c.id] ?? c.note ?? ''}
+                  onChange={e => setRcNotes(prev => ({ ...prev, [c.id]: e.target.value }))}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* All Members Statement */}
       {mode === 'all' && allStatement && (
@@ -2732,6 +3267,46 @@ function StatementsTab({ setError }) {
                 This member is on track with all pledges - nothing behind schedule.
               </div>
             )
+          )}
+
+          {includeEngagement && engagement && (
+            <div className="mt-6 border border-indigo-200 rounded-lg overflow-hidden">
+              <div className="bg-indigo-50 px-4 py-2">
+                <h3 className="text-sm font-semibold text-indigo-800">Attendance &amp; Engagement</h3>
+              </div>
+              <div className="p-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4 text-center">
+                  <div className="bg-gray-50 rounded-lg py-2"><div className="text-[11px] text-gray-500">Attended</div><div className="font-bold text-green-700">{engagement.attended}</div></div>
+                  <div className="bg-gray-50 rounded-lg py-2"><div className="text-[11px] text-gray-500">Missed</div><div className="font-bold text-red-700">{engagement.absent}</div></div>
+                  <div className="bg-gray-50 rounded-lg py-2"><div className="text-[11px] text-gray-500">Services</div><div className="font-bold text-gray-800">{engagement.total_services}</div></div>
+                  <div className="bg-gray-50 rounded-lg py-2"><div className="text-[11px] text-gray-500">Rate</div><div className="font-bold text-indigo-700">{engagement.attendance_rate}%</div></div>
+                </div>
+                {engagement.services && engagement.services.length > 0 ? (
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-200">
+                      <tr>
+                        <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Date</th>
+                        <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Service</th>
+                        <th className="text-center px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {engagement.services.map((s, i) => (
+                        <tr key={i}>
+                          <td className="px-3 py-2 text-gray-600">{formatDate(s.date)}</td>
+                          <td className="px-3 py-2 text-gray-700">{s.service_name || stSvcLabel[s.type] || s.type}</td>
+                          <td className="px-3 py-2 text-center">
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${s.status === 'present' || s.status === 'late' ? 'bg-green-100 text-green-700' : s.status === 'absent' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-500'}`}>{stStatusLabel[s.status] || s.status}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-sm text-gray-500 text-center py-2">No services in this period.</p>
+                )}
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -4063,6 +4638,43 @@ function IncomeStatementRow({ item, type, dateFrom, dateTo }) {
   );
 }
 
+// A collapsible group header (e.g. "Utilities") that rolls up several expense
+// categories with a subtotal; expanding shows each category (still drill-down-able).
+function ExpenseGroupRow({ name, rows, dateFrom, dateTo }) {
+  const [open, setOpen] = useState(false);
+  const total = rows.reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+  return (
+    <>
+      <div className="flex items-center justify-between py-1.5 px-2 hover:bg-indigo-50 rounded cursor-pointer bg-indigo-50/50" onClick={() => setOpen(o => !o)}>
+        <div className="flex items-center gap-2">
+          <ChevronRight size={14} className={`text-indigo-400 transition-transform ${open ? 'rotate-90' : ''}`} />
+          <span className="text-sm font-semibold text-indigo-800">{name}</span>
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-100 text-indigo-700">{rows.length}</span>
+        </div>
+        <span className="text-sm font-semibold text-indigo-900">{formatCurrency(total)}</span>
+      </div>
+      {open && (
+        <div className="ml-5 border-l-2 border-indigo-100 pl-2">
+          {rows.map(r => (
+            <IncomeStatementRow key={r.id} item={r} type="expense" dateFrom={dateFrom} dateTo={dateTo} />
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// Split expense rows into named groups (category_group) + ungrouped, preserving order.
+function groupExpenseRows(rows) {
+  const groups = {}; const order = []; const ungrouped = [];
+  rows.forEach(r => {
+    const g = (r.category_group || '').trim();
+    if (g) { if (!groups[g]) { groups[g] = []; order.push(g); } groups[g].push(r); }
+    else ungrouped.push(r);
+  });
+  return { groups, order, ungrouped };
+}
+
 function IncomeStatementView({ data }) {
   return (
     <div className="card">
@@ -4092,9 +4704,20 @@ function IncomeStatementView({ data }) {
       <div className="mb-6">
         <h3 className="text-sm font-bold text-red-700 uppercase tracking-wider mb-3 border-b-2 border-red-200 pb-1">Expenses</h3>
         <div className="space-y-0.5">
-          {(data.expenses || []).filter(r => parseFloat(r.total) > 0).map(r => (
-            <IncomeStatementRow key={r.id} item={r} type="expense" dateFrom={data.date_from} dateTo={data.date_to} />
-          ))}
+          {(() => {
+            const rows = (data.expenses || []).filter(r => parseFloat(r.total) > 0);
+            const { groups, order, ungrouped } = groupExpenseRows(rows);
+            return (
+              <>
+                {order.map(g => (
+                  <ExpenseGroupRow key={g} name={g} rows={groups[g]} dateFrom={data.date_from} dateTo={data.date_to} />
+                ))}
+                {ungrouped.map(r => (
+                  <IncomeStatementRow key={r.id} item={r} type="expense" dateFrom={data.date_from} dateTo={data.date_to} />
+                ))}
+              </>
+            );
+          })()}
           <div className="flex items-center justify-between py-2 px-2 bg-red-50 rounded-lg mt-2 font-semibold">
             <span className="text-sm text-red-800">Total Expenses</span>
             <span className="text-sm text-red-800">{formatCurrency(data.total_expenses)}</span>
@@ -4665,6 +5288,55 @@ function PledgesTab({ setError, setMessage, isAdmin }) {
 
   const freqLabel = { weekly: 'Weekly', monthly: 'Monthly', quarterly: 'Quarterly', annually: 'Annually' };
   const behindAlerts = alerts.filter(a => a.behind_by > 0);
+  const behindTotal = () => behindAlerts.reduce((s, a) => s + (a.behind_by || 0), 0);
+
+  // A printable / PDF "call sheet" so someone can be assigned each month to phone
+  // the members who are behind on their pledge, and tick them off as they go.
+  const downloadCallSheetPDF = () => {
+    const doc = new jsPDF();
+    doc.setFontSize(16);
+    doc.text('Love and Healing', 14, 15);
+    doc.setFontSize(13);
+    doc.text('Pledge Follow-Up Call Sheet', 14, 23);
+    doc.setFontSize(9);
+    doc.setTextColor(100);
+    doc.text(`Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}   -   ${behindAlerts.length} behind schedule   -   Total balance to date ${formatCurrency(behindTotal())}`, 14, 29);
+    doc.setTextColor(0);
+    autoTable(doc, {
+      head: [['#', 'Name', 'Phone', 'Pledge', 'Balance', 'Called', 'Notes']],
+      body: behindAlerts.map((a, i) => ([
+        String(i + 1), a.member_name, a.phone || '-',
+        `${freqLabel[a.frequency] || a.frequency} ${formatCurrency(a.pledge_amount)}`,
+        formatCurrency(a.behind_by), '', '',
+      ])),
+      startY: 36,
+      styles: { fontSize: 9, cellPadding: 3, minCellHeight: 9 },
+      headStyles: { fillColor: [153, 27, 27], textColor: 255 },
+      alternateRowStyles: { fillColor: [249, 250, 251] },
+      columnStyles: { 0: { cellWidth: 12, halign: 'center' }, 4: { halign: 'right' }, 5: { cellWidth: 18, halign: 'center' }, 6: { cellWidth: 42 } },
+    });
+    doc.save(`pledge-call-sheet-${new Date().toISOString().split('T')[0]}.pdf`);
+  };
+
+  const printCallSheet = () => {
+    const rows = behindAlerts.map((a, i) => `
+      <tr><td>${i + 1}</td><td>${a.member_name}</td><td>${a.phone || '-'}</td>
+      <td>${freqLabel[a.frequency] || a.frequency} ${formatCurrency(a.pledge_amount)}</td>
+      <td class="r">${formatCurrency(a.behind_by)}</td><td class="chk"></td><td class="notes"></td></tr>`).join('');
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Pledge Follow-Up Call Sheet</title>
+      <style>body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:24px;}h1{font-size:18px;margin:0;}
+      h2{font-size:14px;margin:2px 0 4px;color:#991b1b;}.meta{font-size:12px;color:#555;margin-bottom:14px;}
+      table{width:100%;border-collapse:collapse;font-size:12px;}th,td{border:1px solid #ccc;padding:7px 8px;text-align:left;vertical-align:top;}
+      th{background:#991b1b;color:#fff;}tr:nth-child(even) td{background:#f9fafb;}.r{text-align:right;}
+      .chk{width:44px;text-align:center;}.notes{width:170px;}</style></head><body>
+      <h1>Love and Healing</h1><h2>Pledge Follow-Up Call Sheet</h2>
+      <div class="meta">Generated ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} &nbsp;&bull;&nbsp; ${behindAlerts.length} behind schedule &nbsp;&bull;&nbsp; Total balance to date ${formatCurrency(behindTotal())}</div>
+      <table><thead><tr><th>#</th><th>Name</th><th>Phone</th><th>Pledge</th><th>Balance</th><th>Called</th><th>Notes</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <script>window.onload=function(){setTimeout(function(){window.print();},250);};<\/script></body></html>`;
+    const win = window.open('', '_blank');
+    if (win) { win.document.write(html); win.document.close(); win.focus(); }
+  };
 
   if (loading) {
     return <div className="flex items-center justify-center py-16"><div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary-700"></div></div>;
@@ -4675,21 +5347,32 @@ function PledgesTab({ setError, setMessage, isAdmin }) {
       {/* Alerts */}
       {behindAlerts.length > 0 && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl">
-          <div className="flex items-center gap-2 mb-2">
-            <AlertCircle size={20} className="text-red-600" />
-            <p className="font-medium text-red-800">
-              {behindAlerts.length} pledge{behindAlerts.length !== 1 ? 's' : ''} behind schedule
-              {' — '}total balance to date {formatCurrency(behindAlerts.reduce((s, a) => s + (a.behind_by || 0), 0))}
-            </p>
+          <div className="flex items-start justify-between gap-3 mb-2 flex-wrap">
+            <div className="flex items-center gap-2">
+              <AlertCircle size={20} className="text-red-600" />
+              <p className="font-medium text-red-800">
+                {behindAlerts.length} pledge{behindAlerts.length !== 1 ? 's' : ''} behind schedule
+                {' — '}total balance to date {formatCurrency(behindTotal())}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={printCallSheet} className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-red-300 text-red-700 bg-white hover:bg-red-100" title="Print a call sheet to phone these members">
+                <Printer size={14} /> Print call sheet
+              </button>
+              <button onClick={downloadCallSheetPDF} className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-red-300 text-red-700 bg-white hover:bg-red-100" title="Download the call sheet as a PDF">
+                <Download size={14} /> PDF
+              </button>
+            </div>
           </div>
           <div className="space-y-1">
             {behindAlerts.map((a, i) => (
               <div key={i} className="flex items-center justify-between text-sm px-2 py-1 rounded hover:bg-red-100">
-                <span className="text-red-700">{a.member_name} - {a.category} ({freqLabel[a.frequency]} {formatCurrency(a.pledge_amount)})</span>
+                <span className="text-red-700">{a.member_name}{a.phone ? ` (${a.phone})` : ''} - {a.category} ({freqLabel[a.frequency]} {formatCurrency(a.pledge_amount)})</span>
                 <span className="text-red-800 font-medium">Balance {formatCurrency(a.behind_by)}</span>
               </div>
             ))}
           </div>
+          <p className="text-xs text-red-500 mt-2">The call sheet lists each person with their phone number and a blank "Called / Notes" column so you can assign someone to follow up each month.</p>
         </div>
       )}
 
@@ -5340,6 +6023,25 @@ function ChartOfAccountsTab({ setError, setMessage, isAdmin }) {
     } catch (err) { setError(err.message); }
   };
 
+  // Open the transfer editor for a ledger row (fetches the transfer's real
+  // from/to/amount/notes so both sides can be corrected).
+  const openTransferEdit = async (e) => {
+    setReportEdit({ record_id: e.reference_id, source: 'transfer', amount: Math.abs(parseFloat(e.amount)), date: e.entry_date, description: '', loading: true });
+    try {
+      const res = await financeApi.transferEntry(e.reference_id);
+      const t = res.transfer || {};
+      setReportEdit({
+        record_id: e.reference_id,
+        source: 'transfer',
+        from_account_id: t.from_account_id || '',
+        to_account_id: t.to_account_id || '',
+        amount: Math.abs(parseFloat(t.amount ?? e.amount)),
+        date: t.transfer_date || e.entry_date,
+        description: t.notes || '',
+      });
+    } catch (err) { setError(err.message); }
+  };
+
   const handleReportEditSave = async () => {
     if (!reportEdit) return;
     setReportEditSaving(true);
@@ -5349,6 +6051,16 @@ function ChartOfAccountsTab({ setError, setMessage, isAdmin }) {
         await financeApi.update(record_id, { amount: parseFloat(amount), notes: description, donation_date: date, payment_method: method });
       } else if (source === 'expense') {
         await financeApi.updateExpense(record_id, { amount: parseFloat(amount), description, expense_date: date, payment_method: method });
+      } else if (source === 'transfer') {
+        if (!reportEdit.from_account_id || !reportEdit.to_account_id) { setError('Please choose both accounts'); setReportEditSaving(false); return; }
+        if (reportEdit.from_account_id === reportEdit.to_account_id) { setError('Cannot transfer to the same account'); setReportEditSaving(false); return; }
+        await financeApi.updateTransfer(record_id, {
+          from_account_id: reportEdit.from_account_id,
+          to_account_id: reportEdit.to_account_id,
+          amount: parseFloat(amount),
+          transfer_date: date,
+          notes: description,
+        });
       } else if (source === 'loan') {
         await financeApi.updateLoanTransaction(record_id, {
           amount: parseFloat(amount), description, transaction_date: date,
@@ -5907,6 +6619,11 @@ function ChartOfAccountsTab({ setError, setMessage, isAdmin }) {
                                   <Edit2 size={14} />
                                 </button>
                               )}
+                              {e.reference_type === 'transfer' && e.reference_id && (
+                                <button onClick={() => openTransferEdit(e)} className="p-1 text-gray-300 hover:text-blue-600" title="Edit transfer">
+                                  <Edit2 size={14} />
+                                </button>
+                              )}
                               <button onClick={() => handleDeleteEntry(e)} className="p-1 text-gray-300 hover:text-red-500" title="Delete entry">
                                 <Trash2 size={14} />
                               </button>
@@ -5927,9 +6644,27 @@ function ChartOfAccountsTab({ setError, setMessage, isAdmin }) {
       </Modal>
 
       {/* Inline Edit Modal for Account Report */}
-      <Modal isOpen={!!reportEdit} onClose={() => setReportEdit(null)} title="Edit Entry" size="sm">
+      <Modal isOpen={!!reportEdit} onClose={() => setReportEdit(null)} title={reportEdit?.source === 'transfer' ? 'Edit Transfer' : 'Edit Entry'} size="sm">
         {reportEdit && (
           <div className="space-y-3">
+            {reportEdit.source === 'transfer' && (
+              <>
+                <div>
+                  <label className="label">From Account</label>
+                  <select className="input" value={reportEdit.from_account_id || ''} onChange={e => setReportEdit(r => ({ ...r, from_account_id: e.target.value }))}>
+                    <option value="">Select account...</option>
+                    {transferableAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="label">To Account</label>
+                  <select className="input" value={reportEdit.to_account_id || ''} onChange={e => setReportEdit(r => ({ ...r, to_account_id: e.target.value }))}>
+                    <option value="">Select account...</option>
+                    {transferableAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                  </select>
+                </div>
+              </>
+            )}
             <div>
               <label className="label">Date</label>
               <input type="date" className="input" value={reportEdit.date} onChange={e => setReportEdit(r => ({ ...r, date: e.target.value }))} />
@@ -5939,7 +6674,7 @@ function ChartOfAccountsTab({ setError, setMessage, isAdmin }) {
               <input type="number" step="0.01" className="input" value={reportEdit.amount} onChange={e => setReportEdit(r => ({ ...r, amount: e.target.value }))} />
             </div>
             <div>
-              <label className="label">Description / Notes</label>
+              <label className="label">{reportEdit.source === 'transfer' ? 'Notes' : 'Description / Notes'}</label>
               <input className="input" value={reportEdit.description} onChange={e => setReportEdit(r => ({ ...r, description: e.target.value }))} />
             </div>
             <div className="flex justify-end gap-2 pt-2">
@@ -5969,6 +6704,9 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
   const [entityFilter, setEntityFilter] = useState('all');
   const [expandedId, setExpandedId] = useState(null);
   const [deleteId, setDeleteId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
 
   const loadLogs = useCallback(async () => {
     setLoading(true);
@@ -5982,6 +6720,7 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
       setLogs(data.logs || []);
       setTotal(data.total || 0);
       setPages(data.pages || 1);
+      setSelectedIds([]);
     } catch (err) {
       setError(err.message);
     }
@@ -5989,6 +6728,12 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
   }, [page, dateFrom, dateTo, actionFilter, entityFilter, setError]);
 
   useEffect(() => { loadLogs(); }, [loadLogs]);
+
+  const toggleOne = (id) =>
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const allOnPageSelected = logs.length > 0 && logs.every(l => selectedIds.includes(l.id));
+  const toggleAll = () =>
+    setSelectedIds(allOnPageSelected ? [] : logs.map(l => l.id));
 
   const handleDelete = async () => {
     if (!deleteId) return;
@@ -6000,6 +6745,20 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
     } catch (err) {
       setError(err.message);
     }
+  };
+
+  const handleBulkDelete = async () => {
+    if (!selectedIds.length) return;
+    setBulkDeleting(true);
+    try {
+      const res = await auditLogApi.bulkDelete(selectedIds);
+      setBulkOpen(false);
+      setMessage(res.message || 'Entries deleted');
+      loadLogs();
+    } catch (err) {
+      setError(err.message);
+    }
+    setBulkDeleting(false);
   };
 
   const exportCSV = () => {
@@ -6127,6 +6886,20 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
         </div>
       </div>
 
+      {isAdmin && selectedIds.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4 px-4 py-3 rounded-lg bg-primary-50 border border-primary-200">
+          <span className="text-sm font-medium text-primary-800">
+            {selectedIds.length} selected
+          </span>
+          <div className="flex gap-2">
+            <button onClick={() => setSelectedIds([])} className="btn-secondary text-sm">Clear</button>
+            <button onClick={() => setBulkOpen(true)} className="btn-danger text-sm">
+              <Trash2 size={14} /> Delete selected
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="card mb-4">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <input
@@ -6182,6 +6955,17 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
               <table className="w-full">
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
+                    {isAdmin && (
+                      <th className="px-4 py-3 w-10">
+                        <input
+                          type="checkbox"
+                          checked={allOnPageSelected}
+                          onChange={toggleAll}
+                          className="h-4 w-4 rounded border-gray-300 text-primary-700 focus:ring-primary-500 cursor-pointer"
+                          title="Select all on this page"
+                        />
+                      </th>
+                    )}
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Date/Time</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">User</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Action</th>
@@ -6193,7 +6977,17 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
                 <tbody className="divide-y divide-gray-100">
                   {logs.map(log => (
                     <React.Fragment key={log.id}>
-                      <tr className="hover:bg-gray-50">
+                      <tr className={selectedIds.includes(log.id) ? 'bg-primary-50' : 'hover:bg-gray-50'}>
+                        {isAdmin && (
+                          <td className="px-4 py-3">
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.includes(log.id)}
+                              onChange={() => toggleOne(log.id)}
+                              className="h-4 w-4 rounded border-gray-300 text-primary-700 focus:ring-primary-500 cursor-pointer"
+                            />
+                          </td>
+                        )}
                         <td className="px-4 py-3 text-sm text-gray-600">
                           {new Date(log.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
                           <div className="text-xs text-gray-400">{new Date(log.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</div>
@@ -6233,7 +7027,7 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
                       </tr>
                       {expandedId === log.id && (
                         <tr>
-                          <td colSpan={6} className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+                          <td colSpan={isAdmin ? 7 : 6} className="px-4 py-3 bg-gray-50 border-b border-gray-200">
                             <div className="flex items-center gap-4 mb-2 text-xs text-gray-500">
                               <span>Entity ID: #{log.entity_id}</span>
                               {log.ip_address && <span>IP: {log.ip_address}</span>}
@@ -6264,6 +7058,333 @@ function AuditLogTab({ setError, setMessage, isAdmin }) {
           <button onClick={handleDelete} className="btn-danger"><Trash2 size={16} /> Delete</button>
         </div>
       </Modal>
+
+      {/* Bulk Delete Confirmation Modal */}
+      <Modal isOpen={bulkOpen} onClose={() => !bulkDeleting && setBulkOpen(false)} title="Delete Selected Entries" size="sm">
+        <p className="text-gray-600 mb-6">
+          Are you sure you want to delete {selectedIds.length} selected log {selectedIds.length === 1 ? 'entry' : 'entries'}? This action cannot be undone.
+        </p>
+        <div className="flex justify-end gap-3">
+          <button onClick={() => setBulkOpen(false)} className="btn-secondary" disabled={bulkDeleting}>Cancel</button>
+          <button onClick={handleBulkDelete} className="btn-danger" disabled={bulkDeleting}>
+            <Trash2 size={16} /> {bulkDeleting ? 'Deleting...' : `Delete ${selectedIds.length}`}
+          </button>
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+/* ─── Loans & Receivables Tab ─── */
+function LoansTab({ setError, setMessage, isAdmin }) {
+  const [loans, setLoans] = useState([]);
+  const [summary, setSummary] = useState({ lent_outstanding: 0, borrowed_outstanding: 0, outstanding_total: 0 });
+  const [loading, setLoading] = useState(true);
+  const [accounts, setAccounts] = useState([]);
+  const [membersList, setMembersList] = useState([]);
+
+  const [showForm, setShowForm] = useState(false);
+  const emptyLoan = { id: null, direction: 'lent', member_id: '', borrower_name: '', amount: '', loan_date: new Date().toISOString().split('T')[0], due_date: '', purpose: '', notes: '', bank_account_id: '', ledger_account_id: '' };
+  const [form, setForm] = useState(emptyLoan);
+  const [saving, setSaving] = useState(false);
+
+  const [detail, setDetail] = useState(null); // { loan, repayments }
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [repayFor, setRepayFor] = useState(null); // loan being repaid
+  const [repayForm, setRepayForm] = useState({ amount: '', repay_date: new Date().toISOString().split('T')[0], bank_account_id: '', notes: '' });
+  const [repaySaving, setRepaySaving] = useState(false);
+  const [deleteLoan, setDeleteLoan] = useState(null);
+
+  const bankAccounts = accounts.filter(a => a.parent_id && parseInt(a.child_count) === 0 && a.account_type === 'asset');
+  const receivableAccounts = accounts.filter(a => a.parent_id && parseInt(a.child_count) === 0 && a.account_type === 'asset');
+  const liabilityAccounts = accounts.filter(a => a.parent_id && parseInt(a.child_count) === 0 && a.account_type === 'liability');
+  const ledgerChoices = form.direction === 'borrowed' ? liabilityAccounts : receivableAccounts;
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const d = await financeApi.loans();
+      setLoans(d.loans || []);
+      setSummary({ lent_outstanding: d.lent_outstanding || 0, borrowed_outstanding: d.borrowed_outstanding || 0, outstanding_total: d.outstanding_total || 0 });
+    } catch (err) { setError(err.message); }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    load();
+    financeApi.accounts().then(d => setAccounts(d.accounts || [])).catch(() => {});
+    membersApi.list({ limit: 9999, sort: 'last_name' }).then(d => setMembersList(d.members || [])).catch(() => {});
+  }, []);
+
+  const openNew = () => { setForm({ ...emptyLoan, ledger_account_id: (receivableAccounts.find(a => /receivable/i.test(a.name)) || {}).id || '' }); setShowForm(true); };
+  const openEdit = (l) => {
+    setForm({
+      id: l.id, direction: l.direction || 'lent', member_id: l.member_id || '', borrower_name: l.member_id ? '' : (l.borrower_name || ''),
+      amount: l.amount, loan_date: l.loan_date, due_date: l.due_date || '', purpose: l.purpose || '', notes: l.notes || '',
+      bank_account_id: l.bank_account_id || '', ledger_account_id: l.ledger_account_id || '',
+    });
+    setShowForm(true);
+  };
+
+  const handleSave = async () => {
+    if (!form.amount || parseFloat(form.amount) <= 0) { setError('Enter an amount'); return; }
+    if (!form.member_id && !form.borrower_name.trim()) { setError('Choose a person or type a name'); return; }
+    setSaving(true);
+    try {
+      await financeApi.saveLoan(form);
+      setMessage(form.id ? 'Loan updated' : 'Loan recorded');
+      setShowForm(false);
+      load();
+    } catch (err) { setError(err.message); }
+    setSaving(false);
+  };
+
+  const openDetail = async (l) => {
+    setDetailLoading(true); setDetail({ loan: l, repayments: null });
+    try {
+      const d = await financeApi.loanDetail(l.id);
+      setDetail({ loan: d.loan, repayments: d.repayments || [] });
+    } catch (err) { setError(err.message); setDetail(null); }
+    setDetailLoading(false);
+  };
+
+  const openRepay = (l) => { setRepayFor(l); setRepayForm({ amount: '', repay_date: new Date().toISOString().split('T')[0], bank_account_id: l.bank_account_id || '', notes: '' }); };
+  const handleRepay = async () => {
+    if (!repayForm.amount || parseFloat(repayForm.amount) <= 0) { setError('Enter an amount'); return; }
+    setRepaySaving(true);
+    try {
+      await financeApi.repayLoan({ ...repayForm, loan_id: repayFor.id });
+      setMessage('Repayment recorded');
+      setRepayFor(null);
+      load();
+      if (detail && detail.loan && detail.loan.id === repayFor.id) openDetail(repayFor);
+    } catch (err) { setError(err.message); }
+    setRepaySaving(false);
+  };
+
+  const handleDeleteRepayment = async (repId) => {
+    if (!confirm('Remove this repayment? The balance will be adjusted back.')) return;
+    try {
+      await financeApi.deleteLoanRepayment(repId);
+      setMessage('Repayment removed');
+      load();
+      if (detail && detail.loan) openDetail(detail.loan);
+    } catch (err) { setError(err.message); }
+  };
+
+  const confirmDelete = async () => {
+    try {
+      await financeApi.deleteLoanRecord(deleteLoan.id);
+      setMessage('Loan deleted');
+      setDeleteLoan(null);
+      if (detail && detail.loan && detail.loan.id === deleteLoan.id) setDetail(null);
+      load();
+    } catch (err) { setError(err.message); }
+  };
+
+  const statusPill = (l) => {
+    if (l.status === 'paid') return <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">Paid</span>;
+    if (parseFloat(l.total_repaid) > 0) return <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-700">Partly paid</span>;
+    return <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">Open</span>;
+  };
+
+  if (loading) {
+    return <div className="flex items-center justify-center py-16"><div className="animate-spin rounded-full h-10 w-10 border-b-2 border-primary-700"></div></div>;
+  }
+
+  return (
+    <>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+        <div className="card bg-indigo-50 py-3"><div className="text-xs text-indigo-600">Owed to the church (money lent out)</div><div className="text-lg font-bold text-indigo-800">{formatCurrency(summary.lent_outstanding)}</div></div>
+        <div className="card bg-rose-50 py-3"><div className="text-xs text-rose-600">Owed by the church (money borrowed)</div><div className="text-lg font-bold text-rose-800">{formatCurrency(summary.borrowed_outstanding)}</div></div>
+        <div className="card py-3 flex items-center justify-end">
+          <button onClick={openNew} className="btn-primary text-sm"><Plus size={15} /> Record Loan</button>
+        </div>
+      </div>
+
+      <div className="card p-0 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-gray-50 border-b border-gray-200">
+              <tr>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Person</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Purpose</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase hidden sm:table-cell">Date</th>
+                <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Amount</th>
+                <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase hidden sm:table-cell">Balance</th>
+                <th className="text-center px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
+                <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {loans.length === 0 && (
+                <tr><td colSpan={7} className="px-4 py-10 text-center text-gray-400">No loans recorded yet. Click "Record Loan" to add one.</td></tr>
+              )}
+              {loans.map(l => (
+                <tr key={l.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3">
+                    <button onClick={() => openDetail(l)} className="text-sm font-medium text-primary-700 hover:underline text-left">{l.borrower || '(no name)'}</button>
+                    <div className="text-[11px] text-gray-400">{l.direction === 'borrowed' ? 'Borrowed by church' : 'Lent by church'}</div>
+                  </td>
+                  <td className="px-4 py-3 text-sm text-gray-600 hidden md:table-cell max-w-[220px] truncate" title={l.purpose || ''}>{l.purpose || '-'}</td>
+                  <td className="px-4 py-3 text-sm text-gray-500 hidden sm:table-cell">{formatDate(l.loan_date)}</td>
+                  <td className="px-4 py-3 text-sm text-right font-semibold text-gray-800">{formatCurrency(l.amount)}</td>
+                  <td className="px-4 py-3 text-sm text-right hidden sm:table-cell font-semibold text-gray-800">{formatCurrency(l.balance)}</td>
+                  <td className="px-4 py-3 text-center">{statusPill(l)}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-end gap-1">
+                      <button onClick={() => openDetail(l)} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded" title="Details"><Eye size={15} /></button>
+                      {l.status !== 'paid' && <button onClick={() => openRepay(l)} className="p-1.5 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded" title="Record repayment"><DollarSign size={15} /></button>}
+                      <button onClick={() => openEdit(l)} className="p-1.5 text-gray-400 hover:text-primary-700 hover:bg-primary-50 rounded" title="Edit"><Edit2 size={15} /></button>
+                      {isAdmin && <button onClick={() => setDeleteLoan(l)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded" title="Delete"><Trash2 size={15} /></button>}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Record / Edit Loan */}
+      <Modal isOpen={showForm} onClose={() => setShowForm(false)} title={form.id ? 'Edit Loan' : 'Record a Loan'} size="md">
+        <div className="space-y-4">
+          <div>
+            <label className="label">Type</label>
+            <select className="input" value={form.direction} onChange={e => setForm(f => ({ ...f, direction: e.target.value, ledger_account_id: '' }))}>
+              <option value="lent">The church lent money out (someone owes us)</option>
+              <option value="borrowed">The church borrowed money (we owe someone)</option>
+            </select>
+          </div>
+          <div>
+            <label className="label">{form.direction === 'borrowed' ? 'Lender (who we owe)' : 'Borrower (who owes us)'}</label>
+            <MemberTypeahead membersList={membersList} value={form.member_id || ''} donorName={form.borrower_name || ''}
+              onChange={val => setForm(f => ({ ...f, member_id: val, borrower_name: val ? '' : f.borrower_name }))}
+              onDonorNameChange={val => setForm(f => ({ ...f, borrower_name: val, member_id: val ? '' : f.member_id }))}
+              onAddNew={() => {}} />
+            <p className="text-xs text-gray-400 mt-1">Pick a person from your list, or just type any name.</p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="label">Amount ($)</label><input type="number" step="0.01" className="input" value={form.amount} onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} /></div>
+            <div><label className="label">Date</label><input type="date" className="input" value={form.loan_date} onChange={e => setForm(f => ({ ...f, loan_date: e.target.value }))} /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="label">Due date (optional)</label><input type="date" className="input" value={form.due_date} onChange={e => setForm(f => ({ ...f, due_date: e.target.value }))} /></div>
+            <div><label className="label">Purpose (optional)</label><input className="input" placeholder="e.g. emergency help" value={form.purpose} onChange={e => setForm(f => ({ ...f, purpose: e.target.value }))} /></div>
+          </div>
+          <div>
+            <label className="label">Notes / details (optional)</label>
+            <textarea className="input" rows={2} placeholder="Anything you want to remember about this loan — terms, agreement, phone number, etc." value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">{form.direction === 'borrowed' ? 'Money went into' : 'Money came from'}</label>
+              <select className="input" value={form.bank_account_id} onChange={e => setForm(f => ({ ...f, bank_account_id: e.target.value }))}>
+                <option value="">Not tracked in an account</option>
+                {bankAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="label">{form.direction === 'borrowed' ? 'Track under (liability)' : 'Track under (receivable)'}</label>
+              <select className="input" value={form.ledger_account_id} onChange={e => setForm(f => ({ ...f, ledger_account_id: e.target.value }))}>
+                <option value="">Not tracked in an account</option>
+                {ledgerChoices.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <p className="text-xs text-gray-400">If you pick both accounts, the money movement is recorded and the balances update automatically. Leave them blank to just keep a note of the loan.</p>
+          <div className="flex justify-end gap-3 pt-2">
+            <button onClick={() => setShowForm(false)} className="btn-secondary">Cancel</button>
+            <button onClick={handleSave} disabled={saving} className="btn-primary"><Check size={16} /> {form.id ? 'Save' : 'Record'}</button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Loan detail */}
+      <Modal isOpen={!!detail} onClose={() => setDetail(null)} title="Loan Details" size="md">
+        {detailLoading || !detail?.repayments ? (
+          <div className="py-8 text-center text-gray-400">Loading...</div>
+        ) : detail && (
+          <div className="space-y-4">
+            <div className="bg-gray-50 rounded-lg p-4 space-y-1.5 text-sm">
+              <div className="flex justify-between"><span className="text-gray-500">Person</span><span className="font-medium text-gray-900">{detail.loan.borrower || '(no name)'}</span></div>
+              {detail.loan.member_phone && <div className="flex justify-between"><span className="text-gray-500">Phone</span><span className="text-gray-700">{detail.loan.member_phone}</span></div>}
+              <div className="flex justify-between"><span className="text-gray-500">Type</span><span className="text-gray-700">{detail.loan.direction === 'borrowed' ? 'Church borrowed' : 'Church lent'}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">Amount</span><span className="font-medium text-gray-900">{formatCurrency(detail.loan.amount)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">Date</span><span className="text-gray-700">{formatDate(detail.loan.loan_date)}</span></div>
+              {detail.loan.due_date && <div className="flex justify-between"><span className="text-gray-500">Due</span><span className="text-gray-700">{formatDate(detail.loan.due_date)}</span></div>}
+              {detail.loan.purpose && <div className="flex justify-between"><span className="text-gray-500">Purpose</span><span className="text-gray-700 text-right">{detail.loan.purpose}</span></div>}
+              {detail.loan.bank_account_name && <div className="flex justify-between"><span className="text-gray-500">Bank account</span><span className="text-gray-700">{detail.loan.bank_account_name}</span></div>}
+              {detail.loan.ledger_account_name && <div className="flex justify-between"><span className="text-gray-500">Tracked under</span><span className="text-gray-700">{detail.loan.ledger_account_name}</span></div>}
+              {detail.loan.created_by_name && <div className="flex justify-between"><span className="text-gray-500">Recorded by</span><span className="text-gray-700">{detail.loan.created_by_name}</span></div>}
+            </div>
+            {detail.loan.notes && (
+              <div className="text-sm"><div className="text-gray-500 mb-1">Notes</div><div className="bg-white border border-gray-200 rounded-lg p-3 text-gray-700 whitespace-pre-wrap">{detail.loan.notes}</div></div>
+            )}
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="bg-gray-50 rounded-lg py-2"><div className="text-[11px] text-gray-500">Amount</div><div className="font-bold text-gray-800">{formatCurrency(detail.loan.amount)}</div></div>
+              <div className="bg-green-50 rounded-lg py-2"><div className="text-[11px] text-green-600">Repaid</div><div className="font-bold text-green-700">{formatCurrency(detail.loan.total_repaid)}</div></div>
+              <div className="bg-indigo-50 rounded-lg py-2"><div className="text-[11px] text-indigo-600">Balance</div><div className="font-bold text-indigo-800">{formatCurrency(detail.loan.balance)}</div></div>
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-gray-700">Repayments</h4>
+                {detail.loan.status !== 'paid' && <button onClick={() => openRepay(detail.loan)} className="btn-secondary text-xs"><Plus size={13} /> Add</button>}
+              </div>
+              {detail.repayments.length === 0 ? (
+                <p className="text-sm text-gray-400 py-2">No repayments recorded yet.</p>
+              ) : (
+                <div className="space-y-1">
+                  {detail.repayments.map(r => (
+                    <div key={r.id} className="flex items-center justify-between text-sm bg-white border border-gray-100 rounded px-3 py-1.5">
+                      <div>
+                        <span className="text-gray-700">{formatDate(r.repay_date)}</span>
+                        {r.notes && <span className="text-gray-400 ml-2">{r.notes}</span>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-green-700">{formatCurrency(r.amount)}</span>
+                        {isAdmin && <button onClick={() => handleDeleteRepayment(r.id)} className="text-gray-300 hover:text-red-500"><Trash2 size={13} /></button>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Repay */}
+      <Modal isOpen={!!repayFor} onClose={() => setRepayFor(null)} title={`Record Repayment${repayFor ? ' — ' + (repayFor.borrower || '') : ''}`} size="sm">
+        <div className="space-y-4">
+          {repayFor && <p className="text-sm text-gray-500">Balance owing: <span className="font-semibold text-gray-800">{formatCurrency(repayFor.balance)}</span></p>}
+          <div className="grid grid-cols-2 gap-3">
+            <div><label className="label">Amount ($)</label><input type="number" step="0.01" className="input" value={repayForm.amount} onChange={e => setRepayForm(f => ({ ...f, amount: e.target.value }))} /></div>
+            <div><label className="label">Date</label><input type="date" className="input" value={repayForm.repay_date} onChange={e => setRepayForm(f => ({ ...f, repay_date: e.target.value }))} /></div>
+          </div>
+          <div>
+            <label className="label">{repayFor && repayFor.direction === 'borrowed' ? 'Paid from account' : 'Deposited to account'}</label>
+            <select className="input" value={repayForm.bank_account_id} onChange={e => setRepayForm(f => ({ ...f, bank_account_id: e.target.value }))}>
+              <option value="">Not tracked in an account</option>
+              {bankAccounts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+          <div><label className="label">Notes (optional)</label><input className="input" value={repayForm.notes} onChange={e => setRepayForm(f => ({ ...f, notes: e.target.value }))} /></div>
+          <div className="flex justify-end gap-3 pt-2">
+            <button onClick={() => setRepayFor(null)} className="btn-secondary">Cancel</button>
+            <button onClick={handleRepay} disabled={repaySaving} className="btn-primary"><Check size={16} /> Record</button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Delete confirm */}
+      <Modal isOpen={!!deleteLoan} onClose={() => setDeleteLoan(null)} title="Delete Loan" size="sm">
+        <p className="text-gray-600 mb-6">Delete this loan to {deleteLoan?.borrower || 'this person'} and all its repayments? Any account balances will be corrected. This cannot be undone.</p>
+        <div className="flex justify-end gap-3">
+          <button onClick={() => setDeleteLoan(null)} className="btn-secondary">Cancel</button>
+          <button onClick={confirmDelete} className="btn-danger"><Trash2 size={16} /> Delete</button>
+        </div>
+      </Modal>
     </>
   );
 }
@@ -6276,8 +7397,11 @@ function CategoriesTab({ setError, setMessage }) {
   const [showModal, setShowModal] = useState(false);
   const [editCat, setEditCat] = useState(null);
   const [catType, setCatType] = useState('donation');
-  const [form, setForm] = useState({ name: '', description: '', fund_type: 'general' });
+  const [form, setForm] = useState({ name: '', description: '', fund_type: 'general', category_group: '' });
   const [saving, setSaving] = useState(false);
+
+  // Distinct groups already in use (for the datalist), e.g. "Utilities".
+  const expenseGroups = [...new Set(expenseCats.map(c => (c.category_group || '').trim()).filter(Boolean))].sort();
 
   const loadCategories = async () => {
     setLoading(true);
@@ -6296,14 +7420,14 @@ function CategoriesTab({ setError, setMessage }) {
   const openNew = (type) => {
     setCatType(type);
     setEditCat(null);
-    setForm({ name: '', description: '', fund_type: 'general' });
+    setForm({ name: '', description: '', fund_type: 'general', category_group: '' });
     setShowModal(true);
   };
 
   const openEdit = (c, type) => {
     setCatType(type);
     setEditCat(c);
-    setForm({ name: c.name, description: c.description || '', fund_type: c.fund_type || 'general' });
+    setForm({ name: c.name, description: c.description || '', fund_type: c.fund_type || 'general', category_group: c.category_group || '' });
     setShowModal(true);
   };
 
@@ -6372,6 +7496,7 @@ function CategoriesTab({ setError, setMessage }) {
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
               <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Name</th>
+              {type === 'expense' && <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Group</th>}
               <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Description</th>
               <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Fund</th>
               <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
@@ -6382,6 +7507,7 @@ function CategoriesTab({ setError, setMessage }) {
             {cats.map(c => (
               <tr key={c.id} className="hover:bg-gray-50">
                 <td className="px-4 py-3 text-sm font-medium text-gray-900">{c.name}</td>
+                {type === 'expense' && <td className="px-4 py-3 text-sm">{c.category_group ? <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700">{c.category_group}</span> : <span className="text-gray-300">-</span>}</td>}
                 <td className="px-4 py-3 text-sm text-gray-500 hidden md:table-cell">{c.description || '-'}</td>
                 <td className="px-4 py-3">
                   <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${fundTypeColor[c.fund_type || 'general']}`}>
@@ -6430,6 +7556,20 @@ function CategoriesTab({ setError, setMessage }) {
             <label className="label">Description</label>
             <input className="input" value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Optional description" />
           </div>
+          {catType === 'expense' && (
+            <div>
+              <label className="label">Group (optional)</label>
+              <input className="input" list="expense-group-list" value={form.category_group}
+                onChange={e => setForm(f => ({ ...f, category_group: e.target.value }))}
+                placeholder="e.g. Utilities" />
+              <datalist id="expense-group-list">
+                {expenseGroups.map(g => <option key={g} value={g} />)}
+              </datalist>
+              <p className="text-xs text-gray-400 mt-1">
+                Put related categories in one group (e.g. Electricity, Gas, Internet, Water all in "Utilities") and reports will roll them up under that group, with a click to see the detail.
+              </p>
+            </div>
+          )}
           <div>
             <label className="label">Fund Type</label>
             <select className="input" value={form.fund_type} onChange={e => setForm(f => ({ ...f, fund_type: e.target.value }))}>

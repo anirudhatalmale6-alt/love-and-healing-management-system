@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { attendance as attendanceApi, services as servicesApi, services as svcApi } from '../utils/api';
 import { useAuth } from '../contexts/AuthContext';
-import { formatTime12h, downloadCSV } from '../utils/format';
+import { formatTime12h, downloadCSV, formatStampChurch } from '../utils/format';
 import { loadPersonTypes, DEFAULT_PERSON_TYPES, colorFor } from '../utils/personTypes';
 import {
   UserCheck, Check, X, Clock, Search, AlertCircle,
@@ -26,15 +26,11 @@ const statusColors = {
 const statusInactive = 'bg-gray-100 text-gray-500 hover:bg-gray-200';
 
 // 'Jul 12, 3:45 PM' - when a user last saved attendance for this service.
-const formatStamp = (ts) => {
-  if (!ts) return '';
-  const d = new Date(String(ts).replace(' ', 'T'));
-  if (isNaN(d.getTime())) return '';
-  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-};
+const formatStamp = (ts) => formatStampChurch(ts);
 
 export default function AttendancePage() {
-  const { user } = useAuth();
+  const { user, canEdit, hasSectionAccess } = useAuth();
+  const canMark = canEdit && hasSectionAccess('attendance', 'mark_edit');
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState('mark');
   const [services, setServices] = useState([]);
@@ -623,13 +619,17 @@ export default function AttendancePage() {
                   >
                     {sortAZ ? <ArrowDownAZ size={16} /> : <ArrowDownZA size={16} />}
                   </button>
-                  <button onClick={markAllPresent} className="btn-secondary btn-sm">
-                    <Check size={16} /> Mark All Present
-                  </button>
-                  <button onClick={saveAttendance} disabled={saving} className="btn-primary">
-                    {saving ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Save size={16} />}
-                    Save Attendance
-                  </button>
+                  {canMark && (
+                    <button onClick={markAllPresent} className="btn-secondary btn-sm">
+                      <Check size={16} /> Mark All Present
+                    </button>
+                  )}
+                  {canMark && (
+                    <button onClick={saveAttendance} disabled={saving} className="btn-primary">
+                      {saving ? <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" /> : <Save size={16} />}
+                      Save Attendance
+                    </button>
+                  )}
                 </div>
               </div>
 

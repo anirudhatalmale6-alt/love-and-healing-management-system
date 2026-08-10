@@ -86,11 +86,11 @@ export default function DashboardPage() {
         {hasPermission('members') && (
           <StatCard
             icon={Users}
-            label="Church Members"
+            label="People"
             value={data.members.total}
             sub={`${data.members.active} active`}
             color="bg-blue-100 text-blue-600"
-            to="/system/public/members?person_type=church_member"
+            to="/system/public/members"
           />
         )}
         {hasPermission('members') && data.members.community > 0 && (
@@ -108,7 +108,9 @@ export default function DashboardPage() {
             icon={UserPlus}
             label="New This Month"
             value={data.members.new_this_month}
-            sub={`${data.members.visitors} visitors`}
+            // Was `${data.members.visitors} visitors` - the API never returned that
+            // field, so the card read "undefined visitors".
+            sub="people added"
             color="bg-green-100 text-green-600"
             to="/system/public/members"
           />

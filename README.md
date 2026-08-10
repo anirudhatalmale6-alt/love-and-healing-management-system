@@ -132,3 +132,32 @@ that group from its people - everything else they belong to is kept.
 - The follow-up reminder script (`api/cron_followup_reminders.php`) needs a daily cron job
   and its own key - set `CHANGE_ME_CRON_KEY` in that file before using it.
 - Requires PHP 8.0 or newer and MySQL/MariaDB.
+- **Set your timezone.** The system stores every time in UTC and shows it in the church's
+  local zone. Open `api/config.php` and set both to your area:
+
+  ```php
+  date_default_timezone_set('America/New_York');   // near the top
+  const CHURCH_TZ = 'America/New_York';            // a few lines below
+  ```
+
+  Use any name from the standard timezone list (`America/Chicago`, `Europe/London`, ...).
+  Daylight saving is then handled automatically - there is nothing to change twice a year.
+
+---
+
+## What is included in this build
+
+Everything the system currently does, including the newest additions:
+
+- **Report Cards** (Finance -> Statements -> Report Cards) - pick any number of people and
+  print or save a one-page card each, showing giving and attendance for a chosen period,
+  with a note you type per person. You can limit it to particular services, and switch the
+  detail rows off to print totals only. The PDF matches the print-out exactly.
+- **Loans / accounts receivable** - record money lent or borrowed with full details and
+  track repayments.
+- **Pledge follow-up call sheet** - print a list of everyone behind on their pledge, with
+  phone numbers and blank "Called / Notes" columns.
+- **Per-section permissions** - give a user view-only access to some sections and full
+  editing on others, and optionally hide phone numbers and addresses from them.
+- **Expense grouping** - group categories (electricity, gas, water...) under one heading
+  such as Utilities, which then rolls up on the reports.

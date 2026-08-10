@@ -92,6 +92,41 @@ function authenticate(): array {
         jsonResponse(['error' => 'Invalid or expired token'], 401);
     }
 
+    // Load the live per-user access flags so changes take effect immediately and
+    // old tokens still honour them. Wrapped in try/catch for pre-migration safety.
+    $payload['view_only'] = 0;
+    $payload['hide_sensitive'] = 0;
+    $payload['section_access'] = [];
+    try {
+        $db = getDB();
+        $u = $db->prepare("SELECT status, view_only, hide_sensitive FROM users WHERE id = ?");
+        $u->execute([$payload['user_id']]);
+        $row = $u->fetch();
+        if ($row) {
+            if (isset($row['status']) && $row['status'] !== 'active') {
+                jsonResponse(['error' => 'Account is inactive. Contact administrator.'], 403);
+            }
+            $payload['view_only'] = (int)($row['view_only'] ?? 0);
+            $payload['hide_sensitive'] = (int)($row['hide_sensitive'] ?? 0);
+        }
+        // Per-section sub-permissions (e.g. members => ['view'] means view-only).
+        $saStmt = $db->prepare("SELECT section, sub_permission FROM user_section_access WHERE user_id = ?");
+        $saStmt->execute([$payload['user_id']]);
+        foreach ($saStmt->fetchAll() as $sa) {
+            $payload['section_access'][$sa['section']][] = $sa['sub_permission'];
+        }
+    } catch (Exception $e) { /* columns may not exist yet */ }
+
+    // View-only accounts may read but not write. Admin/pastor are never view-only.
+    // auth.php defines ALLOW_VIEW_ONLY_WRITE so users can still change their own password.
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $isAdminRole = in_array($payload['role'] ?? '', ['admin', 'pastor']);
+    if (!empty($payload['view_only']) && !$isAdminRole
+        && in_array($method, ['POST', 'PUT', 'DELETE', 'PATCH'])
+        && !defined('ALLOW_VIEW_ONLY_WRITE')) {
+        jsonResponse(['error' => 'Your account is view-only. You can look at everything but cannot make changes. Ask an administrator if you need edit access.'], 403);
+    }
+
     return $payload;
 }
 
@@ -102,6 +137,30 @@ function requireRole(array $user, array $allowedRoles): void {
     if (!in_array($user['role'], $allowedRoles)) {
         jsonResponse(['error' => 'Insufficient permissions'], 403);
     }
+}
+
+/**
+ * Does this user have a given sub-permission on a section?
+ * Admin/pastor always yes. If the user has NO sub-permissions saved for the
+ * section, they have full access (matches the frontend hasSectionAccess). If
+ * they DO have some, they only have the ones listed.
+ */
+function sectionAllows(array $user, string $section, string $subPerm): bool {
+    if (in_array($user['role'] ?? '', ['admin', 'pastor'])) return true;
+    $sa = $user['section_access'][$section] ?? null;
+    if (empty($sa)) return true;
+    return in_array($subPerm, $sa);
+}
+
+/**
+ * Guard a write action: 403 unless the user has the sub-permission on the section.
+ * $subPerms can be one key or several (any match passes, e.g. add_edit OR manage).
+ */
+function requireSectionEdit(array $user, string $section, $subPerms): void {
+    foreach ((array)$subPerms as $sp) {
+        if (sectionAllows($user, $section, $sp)) return;
+    }
+    jsonResponse(['error' => 'You have view-only access to this section. Ask an administrator if you need to make changes here.'], 403);
 }
 
 /**
@@ -116,9 +175,16 @@ function handleLogin(): void {
     }
 
     $db = getDB();
-    $stmt = $db->prepare("SELECT id, email, password_hash, name, role, status FROM users WHERE email = ?");
-    $stmt->execute([$data['email']]);
-    $user = $stmt->fetch();
+    try {
+        $stmt = $db->prepare("SELECT id, email, password_hash, name, role, status, view_only, hide_sensitive FROM users WHERE email = ?");
+        $stmt->execute([$data['email']]);
+        $user = $stmt->fetch();
+    } catch (Exception $e) {
+        // Pre-migration fallback (columns not added yet).
+        $stmt = $db->prepare("SELECT id, email, password_hash, name, role, status FROM users WHERE email = ?");
+        $stmt->execute([$data['email']]);
+        $user = $stmt->fetch();
+    }
 
     if (!$user || !password_verify($data['password'], $user['password_hash'])) {
         jsonResponse(['error' => 'Invalid email or password'], 401);
@@ -166,6 +232,8 @@ function handleLogin(): void {
             'email' => $user['email'],
             'name' => $user['name'],
             'role' => $user['role'],
+            'view_only' => (int)($user['view_only'] ?? 0),
+            'hide_sensitive' => (int)($user['hide_sensitive'] ?? 0),
             'permissions' => $permissions,
             'finance_sections' => $financeSections,
             'section_access' => $sectionAccess,
@@ -413,6 +481,9 @@ function handleResetWithRecovery(): void {
 
 // Route handling - only when auth.php is accessed directly
 if (basename($_SERVER['SCRIPT_FILENAME']) === 'auth.php') {
+    // Auth actions (login, logout, change own password, recovery) are self-service,
+    // so a view-only account is still allowed to perform them.
+    if (!defined('ALLOW_VIEW_ONLY_WRITE')) define('ALLOW_VIEW_ONLY_WRITE', true);
     $method = $_SERVER['REQUEST_METHOD'];
     $action = $_GET['action'] ?? '';
 
@@ -437,12 +508,20 @@ if (basename($_SERVER['SCRIPT_FILENAME']) === 'auth.php') {
     } elseif ($method === 'GET' && $action === 'me') {
         $user = authenticate();
         $db = getDB();
-        $stmt = $db->prepare("SELECT id, email, name, role, status, created_at FROM users WHERE id = ?");
-        $stmt->execute([$user['user_id']]);
-        $userData = $stmt->fetch();
+        try {
+            $stmt = $db->prepare("SELECT id, email, name, role, status, view_only, hide_sensitive, created_at FROM users WHERE id = ?");
+            $stmt->execute([$user['user_id']]);
+            $userData = $stmt->fetch();
+        } catch (Exception $e) {
+            $stmt = $db->prepare("SELECT id, email, name, role, status, created_at FROM users WHERE id = ?");
+            $stmt->execute([$user['user_id']]);
+            $userData = $stmt->fetch();
+        }
         if (!$userData) {
             jsonResponse(['error' => 'User not found'], 404);
         }
+        $userData['view_only'] = (int)($userData['view_only'] ?? 0);
+        $userData['hide_sensitive'] = (int)($userData['hide_sensitive'] ?? 0);
         $perms = [];
         $fSections = [];
         if (in_array($userData['role'], ['leader', 'volunteer'])) {

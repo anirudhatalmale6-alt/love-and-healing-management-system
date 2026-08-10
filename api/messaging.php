@@ -94,6 +94,45 @@ function getMessagingSettings($db) {
     return $settings;
 }
 
+// Send a monitoring copy of an outgoing message to the church / admin, when the
+// pastor has switched it on in Settings. Deliberately ONE summary copy per
+// broadcast or reply (never one per recipient) so the church phone is not flooded.
+// A copy failing must never affect the real send, so errors are swallowed.
+function sendActivityCopy($db, $settings, $summaryText, $emailSubject = null, $emailHtml = null) {
+    if (empty($settings['msg_copy_enabled']) || $settings['msg_copy_enabled'] === '0') return;
+    try {
+        $copyPhone = trim($settings['msg_copy_phone'] ?? '');
+        if ($copyPhone !== '' && !empty($settings['msg_twilio_sid'])) {
+            sendSMS($copyPhone, $summaryText, $settings['msg_twilio_sid'], $settings['msg_twilio_token'], $settings['msg_twilio_number']);
+        }
+        $copyEmail = trim($settings['msg_copy_email'] ?? '');
+        if ($copyEmail !== '' && !empty($settings['msg_sendgrid_key'])) {
+            sendEmail(
+                $copyEmail, 'Church Admin',
+                $settings['msg_from_email'] ?? 'noreply@yourdomain.org',
+                $settings['msg_from_name'] ?? 'Love and Healing',
+                $emailSubject ?: 'Copy of a church message that was just sent',
+                $emailHtml ?: ('<p>' . nl2br(htmlspecialchars($summaryText)) . '</p>'),
+                $settings['msg_sendgrid_key']
+            );
+        }
+    } catch (Exception $e) { /* monitoring copy is best-effort only */ }
+}
+
+// Record an entry in the shared activity log (the `messages` table) so every
+// message any authorised user sends - broadcast OR one-to-one reply - shows up
+// under Sent Messages with the sender's name.
+function logActivityMessage($db, $userId, $type, $subject, $body, $recipients = 1) {
+    try {
+        $db->prepare("
+            INSERT INTO messages
+                (subject, body, message_type, send_type, status, recipient_type,
+                 total_recipients, sent_count, failed_count, sent_at, created_by)
+            VALUES (?, ?, ?, 'now', 'sent', 'individual', ?, ?, 0, NOW(), ?)
+        ")->execute([$subject, $body, $type, $recipients, $recipients, $userId]);
+    } catch (Exception $e) { /* activity logging must never break sending */ }
+}
+
 switch ($method) {
     case 'GET':
         // List messages/broadcasts
@@ -167,7 +206,99 @@ switch ($method) {
                 'sms_configured' => !empty($settings['msg_twilio_sid']),
                 'from_email' => $settings['msg_from_email'] ?? '',
                 'from_name' => $settings['msg_from_name'] ?? 'Love and Healing',
+                // Monitoring copy: send a copy of every outgoing message to the church/admin.
+                'copy_enabled' => !empty($settings['msg_copy_enabled']) && $settings['msg_copy_enabled'] !== '0',
+                'copy_phone' => $settings['msg_copy_phone'] ?? '',
+                'copy_email' => $settings['msg_copy_email'] ?? '',
             ]);
+        }
+
+        // Two-way texting: list of conversations (one row per phone), newest first
+        if ($action === 'inbox') {
+            $rows = $db->query("
+                SELECT c.phone,
+                       MAX(c.member_id) AS member_id,
+                       MAX(c.created_at) AS last_at,
+                       MAX(s.status) AS state,
+                       SUM(CASE WHEN c.direction = 'in' AND c.read_at IS NULL THEN 1 ELSE 0 END) AS unread,
+                       SUBSTRING_INDEX(GROUP_CONCAT(c.body ORDER BY c.created_at DESC, c.id DESC SEPARATOR '\\n\\n<<>>\\n\\n'), '\\n\\n<<>>\\n\\n', 1) AS last_body,
+                       SUBSTRING_INDEX(GROUP_CONCAT(c.direction ORDER BY c.created_at DESC, c.id DESC), ',', 1) AS last_dir
+                FROM sms_conversations c
+                LEFT JOIN sms_conversation_state s ON s.phone = c.phone
+                GROUP BY c.phone
+                HAVING SUM(CASE WHEN c.direction = 'in' THEN 1 ELSE 0 END) > 0
+                ORDER BY last_at DESC
+                LIMIT 300
+            ")->fetchAll();
+
+            // Attach the person's name/photo where we know them
+            $names = [];
+            $ids = array_values(array_filter(array_map(fn($r) => $r['member_id'] ? (int)$r['member_id'] : null, $rows)));
+            if ($ids) {
+                $in = implode(',', array_fill(0, count($ids), '?'));
+                $ms = $db->prepare("SELECT id, first_name, last_name, photo_url FROM members WHERE id IN ($in)");
+                $ms->execute($ids);
+                foreach ($ms->fetchAll() as $m) $names[(int)$m['id']] = $m;
+            }
+            foreach ($rows as &$r) {
+                $r['unread'] = (int)$r['unread'];
+                $r['member_id'] = $r['member_id'] ? (int)$r['member_id'] : null;
+                $m = $r['member_id'] ? ($names[$r['member_id']] ?? null) : null;
+                $r['name'] = $m ? trim($m['first_name'] . ' ' . $m['last_name']) : '';
+                $r['photo_url'] = $m['photo_url'] ?? null;
+                // At-a-glance status for the pastor:
+                //  new      - an unread reply is waiting
+                //  awaiting - they texted last, you have not replied yet
+                //  replied  - you sent the last message
+                //  done     - you marked this thread handled
+                $state = $r['state'] ?? null;
+                if ($r['unread'] > 0)            $r['status'] = 'new';
+                elseif ($state === 'done')       $r['status'] = 'done';
+                elseif ($r['last_dir'] === 'in') $r['status'] = 'awaiting';
+                else                             $r['status'] = 'replied';
+                unset($r['state']);
+            }
+            unset($r);
+            jsonResponse(['conversations' => $rows]);
+        }
+
+        // Total unread inbound texts, for the tab badge
+        if ($action === 'inbox_unread') {
+            $n = (int)$db->query("SELECT COUNT(*) FROM sms_conversations WHERE direction = 'in' AND read_at IS NULL")->fetchColumn();
+            jsonResponse(['unread' => $n]);
+        }
+
+        // All messages in one conversation (and mark its incoming ones read)
+        if ($action === 'thread') {
+            $phone = $_GET['phone'] ?? '';
+            if ($phone === '' && $id) {
+                $st = $db->prepare("SELECT phone FROM members WHERE id = ?");
+                $st->execute([$id]);
+                $phone = (string)$st->fetchColumn();
+            }
+            if ($phone === '') jsonResponse(['error' => 'Phone required'], 400);
+
+            $st = $db->prepare("SELECT c.*, u.name AS sent_by_name
+                                FROM sms_conversations c
+                                LEFT JOIN users u ON u.id = c.created_by
+                                WHERE c.phone = ?
+                                ORDER BY c.created_at ASC, c.id ASC");
+            $st->execute([$phone]);
+            $msgs = $st->fetchAll();
+
+            $db->prepare("UPDATE sms_conversations SET read_at = NOW() WHERE phone = ? AND direction = 'in' AND read_at IS NULL")->execute([$phone]);
+
+            $memberId = findMemberByPhone($db, $phone);
+            $member = null;
+            if ($memberId) {
+                $ms = $db->prepare("SELECT id, first_name, last_name, photo_url, sms_consent, sms_opted_out_at FROM members WHERE id = ?");
+                $ms->execute([$memberId]);
+                $member = $ms->fetch();
+            }
+            $ss = $db->prepare("SELECT status FROM sms_conversation_state WHERE phone = ?");
+            $ss->execute([$phone]);
+            $state = $ss->fetchColumn() ?: 'open';
+            jsonResponse(['phone' => $phone, 'messages' => $msgs, 'member' => $member, 'state' => $state]);
         }
 
         break;
@@ -190,11 +321,87 @@ switch ($method) {
                     }
                 }
             }
+            // Monitoring-copy settings are saved even when blank, so the pastor can
+            // turn the copy off or clear the phone/email. copy_enabled is stored as '1'/'0'.
+            $copyKeys = ['msg_copy_enabled', 'msg_copy_phone', 'msg_copy_email'];
+            foreach ($copyKeys as $key) {
+                if (!array_key_exists($key, $data)) continue;
+                $val = $key === 'msg_copy_enabled' ? (!empty($data[$key]) ? '1' : '0') : trim((string)$data[$key]);
+                try {
+                    $db->prepare("DELETE FROM settings WHERE `key` = ?")->execute([$key]);
+                    if ($val !== '') $db->prepare("INSERT INTO settings (`key`, `value`) VALUES (?, ?)")->execute([$key, $val]);
+                    $saved[] = $key;
+                } catch (Exception $e) {
+                    jsonResponse(['error' => "Failed to save $key: " . $e->getMessage()], 500);
+                }
+            }
             jsonResponse(['message' => 'Configuration saved (' . count($saved) . ' settings)', 'saved' => $saved]);
+        }
+
+        // Reply to one person in the Inbox (a direct 1-to-1 text). No consent
+        // gate here: they texted us first, so answering is allowed.
+        if ($action === 'reply') {
+            requireSectionEdit($currentUser, 'communication', 'send');
+            $data = getRequestBody();
+            $body = trim($data['body'] ?? '');
+            $phone = trim($data['phone'] ?? '');
+            $memberId = !empty($data['member_id']) ? (int)$data['member_id'] : null;
+            if ($body === '') jsonResponse(['error' => 'Message body required'], 400);
+            if ($phone === '' && $memberId) {
+                $st = $db->prepare("SELECT phone FROM members WHERE id = ?");
+                $st->execute([$memberId]);
+                $phone = (string)$st->fetchColumn();
+            }
+            if ($phone === '') jsonResponse(['error' => 'No phone number for this person'], 400);
+
+            $settings = getMessagingSettings($db);
+            if (empty($settings['msg_twilio_sid'])) jsonResponse(['error' => 'SMS is not set up yet (add your Twilio details in Settings).'], 400);
+
+            if (!$memberId) $memberId = findMemberByPhone($db, $phone);
+            $res = sendSMS($phone, $body, $settings['msg_twilio_sid'], $settings['msg_twilio_token'], $settings['msg_twilio_number'], null, true);
+            if (!$res['success']) {
+                $err = json_decode($res['response'], true);
+                jsonResponse(['error' => 'Text failed: ' . ($err['message'] ?? ($res['curl_error'] ?: 'Unknown error'))], 502);
+            }
+            $ok = json_decode($res['response'], true);
+            logSmsConversation($db, $memberId, formatPhone($phone), 'out', $body, $ok['sid'] ?? null, (int)$currentUser['user_id'], true);
+
+            // Who did we text? (for the activity log + monitoring copy)
+            $recipName = '';
+            if ($memberId) {
+                $nq = $db->prepare("SELECT TRIM(CONCAT(first_name, ' ', last_name)) FROM members WHERE id = ?");
+                $nq->execute([$memberId]);
+                $recipName = (string)$nq->fetchColumn();
+            }
+            $who = $recipName !== '' ? $recipName : formatPhone($phone);
+            $sender = $currentUser['name'] ?? 'A church user';
+
+            // Every reply is logged in the shared activity log with the sender's name.
+            logActivityMessage($db, (int)$currentUser['user_id'], 'sms', 'Text reply to ' . $who, $body, 1);
+            // Optional monitoring copy to the church/admin.
+            sendActivityCopy($db, $settings,
+                "[L&H] $sender replied by text to $who: $body",
+                'Copy: text reply to ' . $who,
+                '<p><strong>' . htmlspecialchars($sender) . '</strong> replied by text to <strong>' . htmlspecialchars($who) . '</strong>:</p><blockquote>' . nl2br(htmlspecialchars($body)) . '</blockquote>'
+            );
+            jsonResponse(['message' => 'Sent']);
+        }
+
+        // Mark a conversation handled ("done") or re-open it
+        if ($action === 'set_status') {
+            $data = getRequestBody();
+            $phone = trim($data['phone'] ?? '');
+            $status = ($data['status'] ?? '') === 'done' ? 'done' : 'open';
+            if ($phone === '') jsonResponse(['error' => 'Phone required'], 400);
+            $db->prepare("INSERT INTO sms_conversation_state (phone, status, updated_by, updated_at) VALUES (?, ?, ?, NOW())
+                          ON DUPLICATE KEY UPDATE status = VALUES(status), updated_by = VALUES(updated_by), updated_at = NOW()")
+               ->execute([$phone, $status, (int)$currentUser['user_id']]);
+            jsonResponse(['message' => 'Status updated', 'status' => $status]);
         }
 
         // Create and send message
         if ($action === 'send') {
+            requireSectionEdit($currentUser, 'communication', 'send');
             $data = getRequestBody();
             if (empty($data['body'])) jsonResponse(['error' => 'Message body required'], 400);
 
@@ -353,6 +560,10 @@ switch ($method) {
                             $errBody = json_decode($smsResult['response'], true);
                             $errMsg = $errBody['message'] ?? ($smsResult['curl_error'] ?: 'Unknown error');
                             $db->prepare("UPDATE message_recipients SET error_message = ? WHERE id = ?")->execute([$errMsg, $recp['id']]);
+                        } else {
+                            // Log the outgoing text so the Inbox thread has full context
+                            $okBody = json_decode($smsResult['response'], true);
+                            logSmsConversation($db, $recp['member_id'] ? (int)$recp['member_id'] : null, formatPhone($recp['phone']), 'out', $smsBody, $okBody['sid'] ?? null, (int)$currentUser['user_id'], true);
                         }
                     }
 
@@ -363,6 +574,19 @@ switch ($method) {
 
                 $db->prepare("UPDATE messages SET status = 'sent', sent_count = ?, failed_count = ?, sent_at = NOW() WHERE id = ?")
                     ->execute([$sentCount, $failedCount, $messageId]);
+
+                // Optional monitoring copy to the church/admin - one summary, not one per person.
+                if ($sentCount > 0) {
+                    $sender = $currentUser['name'] ?? 'A church user';
+                    $preview = trim(strip_tags($body));
+                    if (strlen($preview) > 140) $preview = substr($preview, 0, 137) . '...';
+                    $label = $messageType === 'sms' ? 'text' : ($messageType === 'both' ? 'email + text' : 'email');
+                    sendActivityCopy($db, $settings,
+                        "[L&H] $sender sent a $label to $sentCount " . ($sentCount === 1 ? 'person' : 'people') . ": $preview",
+                        'Copy: church ' . $label . ' sent to ' . $sentCount . ' ' . ($sentCount === 1 ? 'person' : 'people'),
+                        '<p><strong>' . htmlspecialchars($sender) . '</strong> sent a ' . $label . ' to <strong>' . $sentCount . '</strong> ' . ($sentCount === 1 ? 'person' : 'people') . ($subject ? ' &mdash; ' . htmlspecialchars($subject) : '') . ':</p><blockquote>' . nl2br(htmlspecialchars($preview)) . '</blockquote>'
+                    );
+                }
 
                 $skippedNote = $smsSkipped
                     ? ' - ' . count($smsSkipped) . ' skipped for SMS (no text consent on file)'

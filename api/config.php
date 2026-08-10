@@ -61,6 +61,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /**
+ * TIMEZONE POLICY
+ * ---------------
+ * The database stores UTC. The church runs on Philadelphia time (America/New_York).
+ * PHP owns the conversion because it has the real timezone database, so EST/EDT is
+ * always applied correctly - including for timestamps recorded in a different
+ * season than the one we are reading them in.
+ *
+ * - churchTime()    : stored UTC  -> ISO-8601 carrying the church's offset for that
+ *                     exact instant, e.g. "2026-08-09T23:10:52-04:00". Browsers
+ *                     parse this exactly, so no guessing happens on the client.
+ * - churchToUtc()   : a naive wall clock typed by a user in Philadelphia -> UTC for
+ *                     storage.
+ * - utcNow()        : "now" in the format the database expects.
+ */
+
+const CHURCH_TZ = 'America/New_York';
+const SQL_DATETIME_RE = '/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/';
+
+function utcNow(): string {
+    return gmdate('Y-m-d H:i:s');
+}
+
+function churchTime(?string $utcDatetime): ?string {
+    if ($utcDatetime === null || $utcDatetime === '' || str_starts_with($utcDatetime, '0000')) return $utcDatetime;
+    try {
+        $dt = new DateTime($utcDatetime, new DateTimeZone('UTC'));
+        $dt->setTimezone(new DateTimeZone(CHURCH_TZ));
+        return $dt->format('c');
+    } catch (Exception $e) {
+        return $utcDatetime;
+    }
+}
+
+function churchToUtc(?string $naiveLocal): ?string {
+    if ($naiveLocal === null || $naiveLocal === '') return null;
+    try {
+        $dt = new DateTime($naiveLocal, new DateTimeZone(CHURCH_TZ));
+        $dt->setTimezone(new DateTimeZone('UTC'));
+        return $dt->format('Y-m-d H:i:s');
+    } catch (Exception $e) {
+        return $naiveLocal;
+    }
+}
+
+/**
+ * Rewrite every bare SQL datetime in an API payload into church-local ISO-8601.
+ * Date-only values ("2026-08-09") and times are deliberately left alone - those are
+ * calendar dates the user picked, not instants.
+ */
+function localizeTimestamps(mixed $data): mixed {
+    if (is_string($data)) {
+        return preg_match(SQL_DATETIME_RE, $data) ? churchTime($data) : $data;
+    }
+    if (is_array($data)) {
+        foreach ($data as $k => $v) { $data[$k] = localizeTimestamps($v); }
+        return $data;
+    }
+    return $data;
+}
+
+/**
  * Get database connection (PDO)
  */
 function getDB(): PDO {
@@ -73,6 +134,13 @@ function getDB(): PDO {
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
                 PDO::ATTR_EMULATE_PREPARES => false,
             ]);
+            // Everything is stored in UTC and converted to church time on the way
+            // out (see churchTime()/jsonResponse()). Pin the session to UTC so a
+            // change in the host's system timezone can never shift stored values.
+            // A named zone like America/New_York is NOT usable here: this MySQL has
+            // no timezone tables loaded, and a fixed numeric offset would misread
+            // summer rows once the clocks go back.
+            $pdo->exec("SET time_zone = '+00:00'");
         } catch (PDOException $e) {
             http_response_code(500);
             echo json_encode(['error' => 'Database connection failed: ' . $e->getMessage()]);
@@ -102,11 +170,12 @@ function getRawDB(): PDO {
 }
 
 /**
- * Send JSON response
+ * Send JSON response. Stored timestamps are UTC, so they are converted to
+ * church-local ISO-8601 here - one place, so every screen agrees.
  */
 function jsonResponse(mixed $data, int $code = 200): void {
     http_response_code($code);
-    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    echo json_encode(localizeTimestamps($data), JSON_UNESCAPED_UNICODE);
     exit();
 }
 
@@ -255,8 +324,13 @@ function rebuildGroupCache(PDO $db, ?int $memberId = null): void {
     }
 }
 
-/** Replace a member's groups with $groupIds and refresh the cache. */
-function syncMemberGroups(PDO $db, int $memberId, array $groupIds): void {
+/**
+ * Replace a member's groups with $groupIds and refresh the cache.
+ * $titles, when given, is a map of group_id => role/title for THIS person in
+ * THAT group (per-group function title). A blank/absent title clears the role
+ * for that group. Titles for groups not in the map are left untouched.
+ */
+function syncMemberGroups(PDO $db, int $memberId, array $groupIds, ?array $titles = null): void {
     $ids = array_values(array_unique(array_filter(array_map('intval', $groupIds))));
 
     if ($ids) {
@@ -270,7 +344,17 @@ function syncMemberGroups(PDO $db, int $memberId, array $groupIds): void {
         $db->prepare("DELETE FROM member_groups WHERE member_id = ?")->execute([$memberId]);
     }
 
+    if ($titles !== null) {
+        $upd = $db->prepare("UPDATE member_groups SET function_title = ? WHERE member_id = ? AND group_id = ?");
+        foreach ($ids as $gid) {
+            if (!array_key_exists($gid, $titles)) continue;
+            $t = trim((string)$titles[$gid]);
+            $upd->execute([$t === '' ? null : $t, $memberId, $gid]);
+        }
+    }
+
     rebuildGroupCache($db, $memberId);
+    refreshMemberPrimaryTitle($db, $memberId);
 }
 
 /** Group ids a member belongs to. */
@@ -278,4 +362,49 @@ function memberGroupIds(PDO $db, int $memberId): array {
     $s = $db->prepare("SELECT group_id FROM member_groups WHERE member_id = ?");
     $s->execute([$memberId]);
     return array_map('intval', $s->fetchAll(PDO::FETCH_COLUMN));
+}
+
+/**
+ * Keep members.function_title as a derived "headline" title = the person's
+ * first non-empty per-group role (by group order). This is only a cache so the
+ * member list / profile keep showing a title; the Groups page uses the real
+ * per-group titles. Called whenever a person's group titles change.
+ */
+/** Last 10 digits of a phone, for loose matching regardless of formatting. */
+function phoneLast10(?string $phone): string {
+    return substr(preg_replace('/\D/', '', (string)$phone), -10);
+}
+
+/** Find the member whose phone matches (by last 10 digits). Null if none. */
+function findMemberByPhone(PDO $db, ?string $phone): ?int {
+    $d10 = phoneLast10($phone);
+    if (strlen($d10) < 10) return null;
+    foreach ($db->query("SELECT id, phone FROM members WHERE phone IS NOT NULL AND phone <> ''")->fetchAll() as $row) {
+        if (phoneLast10($row['phone']) === $d10) return (int)$row['id'];
+    }
+    return null;
+}
+
+/** Record one SMS (incoming or outgoing) in the conversation log. Never throws. */
+function logSmsConversation(PDO $db, ?int $memberId, string $phone, string $direction, string $body, ?string $sid = null, ?int $createdBy = null, bool $read = false): void {
+    try {
+        $db->prepare("INSERT INTO sms_conversations (member_id, phone, direction, body, twilio_sid, created_by, read_at)
+                      VALUES (?, ?, ?, ?, ?, ?, ?)")
+           ->execute([$memberId, $phone, $direction, $body, $sid, $createdBy, $read ? utcNow() : null]);
+    } catch (Exception $e) { /* a logging failure must never break sending */ }
+}
+
+function refreshMemberPrimaryTitle(PDO $db, int $memberId): void {
+    $s = $db->prepare("
+        SELECT mg.function_title
+        FROM member_groups mg
+        JOIN `groups` g ON g.id = mg.group_id
+        WHERE mg.member_id = ? AND mg.function_title IS NOT NULL AND mg.function_title <> ''
+        ORDER BY g.sort_order ASC, g.name ASC
+        LIMIT 1
+    ");
+    $s->execute([$memberId]);
+    $t = $s->fetchColumn();
+    $db->prepare("UPDATE members SET function_title = ? WHERE id = ?")
+       ->execute([$t !== false ? $t : null, $memberId]);
 }

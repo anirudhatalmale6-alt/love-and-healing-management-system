@@ -1,20 +1,4 @@
-# Dependencies
-frontend/node_modules/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Local config
-.env
-.env.local
-
-# Server-only secrets (never commit)
+node_modules/
 api/config.secret.php
-config.secret.php
+uploads/
+backups/

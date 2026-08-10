@@ -12,6 +12,26 @@ $method = $_SERVER['REQUEST_METHOD'];
 $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
 $db = getDB();
 
+// Accounts flagged "hide sensitive info" see names only — never the contact/personal
+// details. Enforced here on the server so the data never leaves the API for them.
+$HIDE_SENSITIVE = !empty($currentUser['hide_sensitive']) && !in_array($currentUser['role'] ?? '', ['admin', 'pastor']);
+$SENSITIVE_FIELDS = ['email', 'phone', 'address', 'city', 'state', 'zip',
+    'date_of_birth', 'notes', 'emergency_contact_name', 'emergency_contact_phone',
+    'emergency_contact', 'household_id', 'household_role', 'baptism_date',
+    'salvation_date', 'wedding_date', 'membership_class_date', 'dedication_date'];
+function stripSensitive($row, $fields) {
+    if (!is_array($row)) return $row;
+    foreach ($fields as $f) { if (array_key_exists($f, $row)) $row[$f] = null; }
+    return $row;
+}
+
+// Per-section access: a user given only "View" on People can't add/edit/delete.
+if ($method === 'DELETE') {
+    requireSectionEdit($currentUser, 'members', 'delete');
+} elseif (in_array($method, ['POST', 'PUT'])) {
+    requireSectionEdit($currentUser, 'members', 'add_edit');
+}
+
 switch ($method) {
     case 'GET':
         if ($id) {
@@ -67,7 +87,8 @@ switch ($method) {
 
             // Groups this person belongs to, with the department each one serves
             $stmt = $db->prepare("
-                SELECT g.id, g.name, g.category, g.department_id, d.name AS department_name
+                SELECT g.id, g.name, g.category, g.department_id, d.name AS department_name,
+                       mg.function_title
                 FROM member_groups mg
                 JOIN `groups` g ON g.id = mg.group_id
                 LEFT JOIN departments d ON d.id = g.department_id
@@ -78,6 +99,10 @@ switch ($method) {
             $member['groups'] = $stmt->fetchAll();
             $member['group_ids'] = array_map('intval', array_column($member['groups'], 'id'));
 
+            if ($HIDE_SENSITIVE) {
+                $member = stripSensitive($member, $SENSITIVE_FIELDS);
+                unset($member['household'], $member['household_members'], $member['recent_attendance']);
+            }
             jsonResponse(['member' => $member]);
         } else {
             // List members with search/filter
@@ -92,10 +117,31 @@ switch ($method) {
             $where = [];
             $params = [];
 
-            if ($search) {
-                $where[] = "(first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ?)";
-                $searchTerm = "%$search%";
-                $params = array_merge($params, [$searchTerm, $searchTerm, $searchTerm, $searchTerm]);
+            if ($search !== '') {
+                // Split the query into words and require EACH word to appear
+                // somewhere in the person's name / email / phone. This lets a
+                // full-name search like "Marc Bien" match a first name of
+                // "Marc Hubert" and a last name of "Bien Aime" (previously the
+                // words were matched per-column, so any cross-field full name
+                // returned nothing). Phone digits are also matched with spaces
+                // and punctuation stripped so "215 478" finds "2154785996".
+                $haystack = "CONCAT_WS(' ', first_name, last_name, email, phone)";
+                $phoneDigits = "REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', '')";
+                $tokens = preg_split('/\s+/', trim($search));
+                foreach ($tokens as $token) {
+                    if ($token === '') continue;
+                    $digits = preg_replace('/[^0-9]/', '', $token);
+                    if ($digits !== '') {
+                        // Token has digits: match the name haystack OR the
+                        // digit-only phone (so "215-478" finds "2154785996").
+                        $where[] = "($haystack LIKE ? OR $phoneDigits LIKE ?)";
+                        $params[] = '%' . $token . '%';
+                        $params[] = '%' . $digits . '%';
+                    } else {
+                        $where[] = "$haystack LIKE ?";
+                        $params[] = '%' . $token . '%';
+                    }
+                }
             }
             if ($status) {
                 $where[] = "status = ?";
@@ -176,6 +222,9 @@ switch ($method) {
                 $typeCountMap[$tc['person_type'] ?: 'unknown'] = (int)$tc['count'];
             }
 
+            if ($HIDE_SENSITIVE) {
+                $members = array_map(fn($m) => stripSensitive($m, $SENSITIVE_FIELDS), $members);
+            }
             jsonResponse([
                 'members' => $members,
                 'total' => (int)$total,
@@ -185,6 +234,7 @@ switch ($method) {
                 'family_groups' => $familyGroups,
                 'groups' => $groupRows,
                 'type_counts' => $typeCountMap,
+                'hide_sensitive' => $HIDE_SENSITIVE ? 1 : 0,
             ]);
         }
         break;
@@ -455,8 +505,8 @@ switch ($method) {
         }
 
         $stmt = $db->prepare("
-            INSERT INTO members (first_name, last_name, email, phone, address, city, state, zip, gender, date_of_birth, family_group, household_id, household_role, membership_date, status, notes, photo_url, card_title, card_expiry_date, baptism_date, salvation_date, first_visit_date, membership_class_date, dedication_date, wedding_date, person_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO members (first_name, last_name, email, phone, address, city, state, zip, gender, date_of_birth, family_group, household_id, household_role, membership_date, status, notes, photo_url, card_title, function_title, card_expiry_date, baptism_date, salvation_date, first_visit_date, membership_class_date, dedication_date, wedding_date, person_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ");
         $stmt->execute([
             trim($data['first_name']),
@@ -477,6 +527,7 @@ switch ($method) {
             $data['notes'] ?? null,
             $data['photo_url'] ?? null,
             $data['card_title'] ?? null,
+            (isset($data['function_title']) && $data['function_title'] !== '') ? $data['function_title'] : null,
             $data['card_expiry_date'] ?? null,
             $data['baptism_date'] ?? null,
             $data['salvation_date'] ?? null,
@@ -509,7 +560,8 @@ switch ($method) {
         }
 
         if (array_key_exists('group_ids', $data) && is_array($data['group_ids'])) {
-            syncMemberGroups($db, (int)$newId, $data['group_ids']);
+            $titles = (isset($data['group_titles']) && is_array($data['group_titles'])) ? $data['group_titles'] : null;
+            syncMemberGroups($db, (int)$newId, $data['group_ids'], $titles);
         }
 
         $stmt = $db->prepare("SELECT * FROM members WHERE id = ?");
@@ -533,6 +585,13 @@ switch ($method) {
         }
 
         $data = getRequestBody();
+
+        // A "hide sensitive info" user can't see personal details, so never let
+        // their save overwrite (blank out) those fields — drop them from the payload.
+        if ($HIDE_SENSITIVE) {
+            foreach ($SENSITIVE_FIELDS as $sf) { unset($data[$sf]); }
+            unset($data['sms_consent'], $data['sms_consent_source'], $data['sms_consent_proof']);
+        }
 
         // SMS consent is not a plain field: turning it ON has to stamp WHEN it
         // was given, HOW, and WHO recorded it, because that record is the proof
@@ -576,7 +635,7 @@ switch ($method) {
             'first_name', 'last_name', 'email', 'phone', 'address', 'city',
             'state', 'zip', 'gender', 'date_of_birth', 'family_group',
             'household_id', 'household_role',
-            'membership_date', 'status', 'notes', 'photo_url', 'card_title',
+            'membership_date', 'status', 'notes', 'photo_url', 'card_title', 'function_title',
             'card_expiry_date', 'baptism_date', 'salvation_date', 'first_visit_date',
             'membership_class_date', 'dedication_date', 'wedding_date',
             'person_type'
@@ -607,9 +666,11 @@ switch ($method) {
             $stmt->execute($params);
         }
 
-        // Runs after the UPDATE so it also refreshes the family_group cache
+        // Runs after the UPDATE so it also refreshes the family_group cache and
+        // the derived headline title from the per-group roles.
         if ($hasGroups) {
-            syncMemberGroups($db, (int)$id, $data['group_ids']);
+            $titles = (isset($data['group_titles']) && is_array($data['group_titles'])) ? $data['group_titles'] : null;
+            syncMemberGroups($db, (int)$id, $data['group_ids'], $titles);
         }
 
         $stmt = $db->prepare("SELECT * FROM members WHERE id = ?");
@@ -622,18 +683,36 @@ switch ($method) {
 
     case 'DELETE':
         requireRole($currentUser, ['pastor', 'admin']);
-        if (!$id) {
+
+        // Accept a single ?id= or a comma-separated ?ids=1,2,3 for bulk delete.
+        $ids = [];
+        if (!empty($_GET['ids'])) {
+            foreach (explode(',', $_GET['ids']) as $part) {
+                $n = (int)trim($part);
+                if ($n > 0) $ids[] = $n;
+            }
+        } elseif ($id) {
+            $ids[] = $id;
+        }
+        $ids = array_values(array_unique($ids));
+
+        if (!$ids) {
             jsonResponse(['error' => 'Member ID required'], 400);
         }
 
-        $stmt = $db->prepare("DELETE FROM members WHERE id = ?");
-        $stmt->execute([$id]);
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = $db->prepare("DELETE FROM members WHERE id IN ($placeholders)");
+        $stmt->execute($ids);
 
         if ($stmt->rowCount() === 0) {
             jsonResponse(['error' => 'Member not found'], 404);
         }
 
-        jsonResponse(['message' => 'Member deleted successfully']);
+        $n = $stmt->rowCount();
+        jsonResponse([
+            'message' => $n . ' ' . ($n === 1 ? 'person' : 'people') . ' deleted successfully',
+            'deleted' => $n,
+        ]);
         break;
 
     default:

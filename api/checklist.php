@@ -4,6 +4,11 @@ require_once __DIR__ . '/auth.php';
 
 $currentUser = authenticate();
 $method = $_SERVER['REQUEST_METHOD'];
+
+// Per-section access: "View" only can't create/edit/delete checklist items.
+if (in_array($method, ['POST', 'PUT', 'DELETE'])) {
+    requireSectionEdit($currentUser, 'checklist', 'manage');
+}
 $db = getDB();
 $action = $_GET['action'] ?? '';
 
@@ -145,7 +150,7 @@ switch ($method) {
             $stmt->execute([
                 $isChecked,
                 $isChecked ? $currentUser['user_id'] : null,
-                $isChecked ? date('Y-m-d H:i:s') : null,
+                $isChecked ? utcNow() : null,
                 $data['notes'] ?? null,
                 $id
             ]);

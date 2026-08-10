@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { checkin, members, settings as settingsApi } from '../utils/api';
 import { useAuth } from '../contexts/AuthContext';
-import { formatTime12h, fmtServiceDate } from '../utils/format';
+import { formatTime12h, fmtServiceDate, toChurchInputValue } from '../utils/format';
 import JsBarcode from 'jsbarcode';
 import QRCodeLib from 'qrcode';
 import {
@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import OfflineCheckin from '../components/OfflineCheckin';
 import { CameraScanner, PhotoScanner, PhotoCapture } from '../components/CheckinCapture';
+import { loadPersonTypes, labelFor } from '../utils/personTypes';
 
 const TABS = [
   { key: 'kiosk', label: 'Check-In Kiosk', icon: QrCode, perm: 'kiosk' },
@@ -566,12 +567,10 @@ function formatTime(dt) {
   });
 }
 
+// Was hardcoded to a -5h offset, so every check-in time in the edit box read an
+// hour early through the summer. Now uses the real Philadelphia zone.
 function toLocalInput(dt) {
-  if (!dt) return '';
-  const d = new Date(dt + (dt.includes('Z') || dt.includes('+') ? '' : 'Z'));
-  const offset = -5 * 60;
-  const local = new Date(d.getTime() + offset * 60000);
-  return local.toISOString().slice(0, 16);
+  return toChurchInputValue(dt);
 }
 
 function TodayLog() {
@@ -1094,20 +1093,14 @@ function QRCodeImg({ value, size = 80 }) {
   return <canvas ref={canvasRef} style={{ width: size, height: size }} />;
 }
 
-const PERSON_TYPE_LABELS = {
-  church_member: 'Member',
-  non_member_attendee: 'Attendee',
-  community: 'Community',
-  companion: 'Companion',
-  other: '',
-};
-
 function PrintCards() {
   const [codes, setCodes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
   const [selected, setSelected] = useState(new Set());
   const [churchSettings, setChurchSettings] = useState({});
+  const [personTypes, setPersonTypes] = useState([]);
   const [cardPrinterMode, setCardPrinterMode] = useState(true);
   const [cardOrientation, setCardOrientation] = useState('landscape');
   // 'both' = front+back interleaved (dual-sided printers).
@@ -1119,11 +1112,15 @@ function PrintCards() {
     Promise.all([
       checkin.codes(),
       settingsApi.get(),
-    ]).then(([codesRes, settingsRes]) => {
+      loadPersonTypes(true),
+    ]).then(([codesRes, settingsRes, typesRes]) => {
       const c = codesRes.codes || [];
       setCodes(c);
-      setSelected(new Set(c.map(x => x.id)));
+      // Start with nothing selected so the user picks exactly who they want
+      // (filter by person type, then Select All, then Print).
+      setSelected(new Set());
       setChurchSettings(settingsRes.settings || {});
+      setPersonTypes(typesRes || []);
     }).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
@@ -1134,11 +1131,22 @@ function PrintCards() {
   const [editingExpiry, setEditingExpiry] = useState(null);
   const [expiryValue, setExpiryValue] = useState('');
 
-  const filtered = search
-    ? codes.filter(c => `${c.first_name} ${c.last_name}`.toLowerCase().includes(search.toLowerCase()))
-    : codes;
+  const filtered = codes.filter(c => {
+    if (typeFilter && c.person_type !== typeFilter) return false;
+    if (search && !`${c.first_name} ${c.last_name}`.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
 
-  const toPrint = filtered.filter(c => selected.has(c.id));
+  // Print everything the user has selected, regardless of the current filter,
+  // so they can select some of one type, switch the filter, add another type,
+  // and print them all together.
+  const toPrint = codes.filter(c => selected.has(c.id));
+
+  // Counts per person type for the filter dropdown.
+  const typeCounts = codes.reduce((acc, c) => {
+    acc[c.person_type] = (acc[c.person_type] || 0) + 1;
+    return acc;
+  }, {});
 
   const toggleSelect = (id) => {
     setSelected(prev => {
@@ -1345,7 +1353,7 @@ function PrintCards() {
       const barcodeDataUrl = canvas.toDataURL('image/png');
       const qrDataUrl = qrDataUrls[i];
       const photoSrc = photoUrls[i];
-      const title = c.card_title || PERSON_TYPE_LABELS[c.person_type] || '';
+      const title = c.card_title || (c.person_type ? labelFor(personTypes, c.person_type) : '') || '';
       const expiryFormatted = c.card_expiry_date ? new Date(c.card_expiry_date + 'T00:00:00').toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' }) : '';
 
       const photoHtml = photoSrc
@@ -1654,16 +1662,34 @@ function PrintCards() {
               className="input pl-9" placeholder="Search by name..."
             />
           </div>
+          <select
+            value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="input w-auto"
+            title="Filter the list by person type"
+          >
+            <option value="">All types ({codes.length})</option>
+            {Object.keys(typeCounts).sort((a, b) =>
+              labelFor(personTypes, a).localeCompare(labelFor(personTypes, b))
+            ).map(t => (
+              <option key={t} value={t}>{labelFor(personTypes, t)} ({typeCounts[t]})</option>
+            ))}
+          </select>
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <label className="flex items-center gap-2 text-sm cursor-pointer" title="Select or deselect everyone currently shown in the list">
               <input
                 type="checkbox"
                 checked={filtered.length > 0 && filtered.every(c => selected.has(c.id))}
                 onChange={toggleAll}
                 className="rounded"
               />
-              Select All ({filtered.length})
+              Select all shown ({filtered.length})
             </label>
+            {selected.size > 0 && (
+              <button onClick={() => setSelected(new Set())} className="text-sm text-gray-500 hover:text-gray-700 underline">
+                Clear ({selected.size})
+              </button>
+            )}
             <button onClick={handlePrint} disabled={toPrint.length === 0} className="btn btn-primary">
               <Printer size={14} /> Print {toPrint.length} Card{toPrint.length !== 1 ? 's' : ''}
             </button>
@@ -1734,7 +1760,7 @@ function PrintCards() {
           <div className="col-span-full p-8 text-center text-gray-400">Loading...</div>
         ) : filtered.length === 0 ? (
           <div className="col-span-full p-8 text-center text-gray-400">
-            {search ? 'No matching members' : 'No codes generated. Go to "Manage Codes" tab first.'}
+            {(search || typeFilter) ? 'No people match this filter' : 'No people found.'}
           </div>
         ) : filtered.map(c => (
           <div
@@ -1752,9 +1778,9 @@ function PrintCards() {
                 />
                 <div>
                   <span className="font-medium text-gray-900">{c.first_name} {c.last_name}</span>
-                  {(c.card_title || (c.person_type && PERSON_TYPE_LABELS[c.person_type])) && (
+                  {(c.card_title || (c.person_type && labelFor(personTypes, c.person_type))) && (
                     <span className="ml-2 text-xs bg-primary-100 text-primary-700 px-1.5 py-0.5 rounded">
-                      {c.card_title || PERSON_TYPE_LABELS[c.person_type]}
+                      {c.card_title || labelFor(personTypes, c.person_type)}
                     </span>
                   )}
                 </div>

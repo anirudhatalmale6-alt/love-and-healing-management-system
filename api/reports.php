@@ -28,6 +28,27 @@ switch ($action) {
         $stmt->execute([$months]);
         $growth = $stmt->fetchAll();
 
+        // Dynamic per-type monthly counts so EVERY configured person type shows in
+        // the trend (not just the four hard-coded ones - Congregant, Visitor,
+        // Ministry Partner and any custom type used to be lumped into a grey "Other").
+        $ptStmt = $db->prepare("
+            SELECT DATE_FORMAT(created_at, '%Y-%m') as month,
+                   COALESCE(NULLIF(person_type, ''), 'unknown') as ptype,
+                   COUNT(*) as c
+            FROM members
+            WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? MONTH)
+            GROUP BY month, ptype
+        ");
+        $ptStmt->execute([$months]);
+        $byMonthType = [];
+        foreach ($ptStmt->fetchAll() as $r) {
+            $byMonthType[$r['month']][$r['ptype']] = (int)$r['c'];
+        }
+        foreach ($growth as &$g) {
+            $g['types'] = $byMonthType[$g['month']] ?? [];
+        }
+        unset($g);
+
         $cumulative = $db->query("
             SELECT
                 DATE_FORMAT(created_at, '%Y-%m') as month,
@@ -66,22 +87,27 @@ switch ($action) {
             'active_members' => (int)$activeMembers,
             'type_breakdown' => $typeBreakdown,
             'status_breakdown' => $statusBreakdown,
+            // The configured person types (with the pastor's custom labels), so the
+            // report shows the same Type & Status names as the People page.
+            'person_types' => getPersonTypes($db),
         ]);
         break;
 
     case 'engagement':
         $period = $_GET['period'] ?? '3';
         $months = max(1, min(12, (int)$period));
-        // Optional: measure engagement against a specific service type only (e.g. Sunday services).
+        // Optional: measure engagement against one OR MORE service types (e.g. the
+        // 8am service + bible study). Accepts a comma-separated service_type list.
         // Empty = count every service type (default).
-        $svcType = trim($_GET['service_type'] ?? '');
-        $typeJoin = $svcType ? " AND s.type = ?" : "";
-        $typeWhere = $svcType ? " AND type = ?" : "";
+        $svcTypes = array_values(array_filter(array_map('trim', explode(',', $_GET['service_type'] ?? '')), fn($v) => $v !== ''));
+        $typePlaceholders = $svcTypes ? implode(',', array_fill(0, count($svcTypes), '?')) : '';
+        $typeJoin  = $svcTypes ? " AND s.type IN ($typePlaceholders)" : "";
+        $typeWhere = $svcTypes ? " AND type IN ($typePlaceholders)" : "";
 
-        $memberParams = $svcType ? [$months, $svcType] : [$months];
+        $memberParams = array_merge([$months], $svcTypes);
         $stmt = $db->prepare("
             SELECT
-                m.id, m.first_name, m.last_name, m.status as member_status, m.family_group,
+                m.id, m.first_name, m.last_name, m.status as member_status, m.person_type, m.family_group,
                 COUNT(DISTINCT s.id) as total_services,
                 COUNT(CASE WHEN (a.status = 'present' OR a.status = 'late') AND s.id IS NOT NULL THEN 1 END) as attended,
                 COUNT(CASE WHEN a.status = 'absent' AND s.id IS NOT NULL THEN 1 END) as absent,
@@ -104,7 +130,7 @@ switch ($action) {
         $svcCount = (int)$totalServices->fetchColumn();
 
         // List of service types available for the filter dropdown
-        $svcTypes = $db->query("SELECT DISTINCT type FROM services WHERE type IS NOT NULL AND type != '' ORDER BY type")->fetchAll(PDO::FETCH_COLUMN);
+        $svcTypesAll = $db->query("SELECT DISTINCT type FROM services WHERE type IS NOT NULL AND type != '' ORDER BY type")->fetchAll(PDO::FETCH_COLUMN);
 
         foreach ($members as &$m) {
             $m['attendance_rate'] = $svcCount > 0
@@ -117,8 +143,9 @@ switch ($action) {
             'members' => $members,
             'total_services' => $svcCount,
             'period_months' => $months,
-            'service_type' => $svcType,
-            'service_types' => $svcTypes,
+            'service_type' => implode(',', $svcTypes),   // selected types (comma list)
+            'service_types_selected' => $svcTypes,
+            'service_types' => $svcTypesAll,             // all types available to pick from
         ]);
         break;
 
@@ -129,23 +156,37 @@ switch ($action) {
         if (!$memberId) jsonResponse(['error' => 'member_id required'], 400);
         $period = $_GET['period'] ?? '3';
         $months = max(1, min(12, (int)$period));
-        $svcType = trim($_GET['service_type'] ?? '');
+        $svcTypes = array_values(array_filter(array_map('trim', explode(',', $_GET['service_type'] ?? '')), fn($v) => $v !== ''));
+        // Optional explicit date range (used by the giving statement so the attendance
+        // section covers the exact same period). Falls back to the last N months.
+        $dateFrom = $_GET['date_from'] ?? '';
+        $dateTo = $_GET['date_to'] ?? '';
+        $useRange = ($dateFrom !== '' && $dateTo !== '');
 
         $mStmt = $db->prepare("SELECT id, first_name, last_name, status as member_status, family_group, email, phone FROM members WHERE id = ?");
         $mStmt->execute([$memberId]);
         $member = $mStmt->fetch();
         if (!$member) jsonResponse(['error' => 'Member not found'], 404);
 
-        // Every service that has already occurred in the period (optionally of one type)
-        $svcTypeWhere = $svcType ? " AND type = ?" : "";
-        $svcParams = $svcType ? [$months, $svcType] : [$months];
-        $sStmt = $db->prepare("
-            SELECT id, name, date, time, type
-            FROM services
-            WHERE date >= DATE_SUB(CURDATE(), INTERVAL ? MONTH) AND date <= CURDATE()$svcTypeWhere
-            ORDER BY date DESC, time DESC
-        ");
-        $sStmt->execute($svcParams);
+        // Every service that has already occurred in the period (optionally of one or more types)
+        $svcTypeWhere = $svcTypes ? " AND type IN (" . implode(',', array_fill(0, count($svcTypes), '?')) . ")" : "";
+        if ($useRange) {
+            $sStmt = $db->prepare("
+                SELECT id, name, date, time, type
+                FROM services
+                WHERE date >= ? AND date <= ? AND date <= CURDATE()$svcTypeWhere
+                ORDER BY date DESC, time DESC
+            ");
+            $sStmt->execute(array_merge([$dateFrom, $dateTo], $svcTypes));
+        } else {
+            $sStmt = $db->prepare("
+                SELECT id, name, date, time, type
+                FROM services
+                WHERE date >= DATE_SUB(CURDATE(), INTERVAL ? MONTH) AND date <= CURDATE()$svcTypeWhere
+                ORDER BY date DESC, time DESC
+            ");
+            $sStmt->execute(array_merge([$months], $svcTypes));
+        }
         $services = $sStmt->fetchAll();
 
         // This member's recorded attendance, keyed by service id
@@ -190,7 +231,7 @@ switch ($action) {
             'attendance_rate' => $rate,
             'last_attended' => $lastAttended,
             'period_months' => $months,
-            'service_type' => $svcType,
+            'service_type' => implode(',', $svcTypes),
         ]);
         break;
 

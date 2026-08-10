@@ -4,6 +4,11 @@ require_once __DIR__ . '/auth.php';
 
 $currentUser = authenticate();
 $method = $_SERVER['REQUEST_METHOD'];
+
+// Per-section access: "View" only can't create/edit/delete groups.
+if (in_array($method, ['POST', 'PUT', 'DELETE'])) {
+    requireSectionEdit($currentUser, 'groups', 'manage');
+}
 $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
 $db = getDB();
 
@@ -13,13 +18,18 @@ switch ($method) {
     case 'GET':
         // Members of one group (used by the expandable card on the Groups page)
         if (($_GET['action'] ?? '') === 'members' && $id) {
+            // People with a role IN THIS GROUP (President, Pastor, Assistant...)
+            // are the "committee" running it, so they list first. The title is
+            // per-group: someone can be an officer here and a plain member of
+            // another group.
             $stmt = $db->prepare("
                 SELECT m.id, m.first_name, m.last_name, m.email, m.phone,
-                       m.person_type, m.status
+                       m.person_type, m.status, mg.function_title
                 FROM member_groups mg
                 JOIN members m ON m.id = mg.member_id
                 WHERE mg.group_id = ?
-                ORDER BY m.last_name ASC, m.first_name ASC
+                ORDER BY (mg.function_title IS NULL OR mg.function_title = '') ASC,
+                         mg.position ASC, m.last_name ASC, m.first_name ASC
             ");
             $stmt->execute([$id]);
             jsonResponse(['members' => $stmt->fetchAll()]);
@@ -84,6 +94,45 @@ switch ($method) {
 
     case 'PUT':
         requireRole($currentUser, ['pastor', 'admin', 'leader']);
+
+        // Save the pastor's hand-picked order of GROUPS within a section.
+        if (($_GET['action'] ?? '') === 'reorder') {
+            $data = getRequestBody();
+            $ids = array_values(array_filter(array_map('intval', $data['group_ids'] ?? [])));
+            if ($ids) {
+                $upd = $db->prepare("UPDATE `groups` SET sort_order = ? WHERE id = ?");
+                foreach ($ids as $pos => $gid) $upd->execute([$pos, $gid]);
+            }
+            jsonResponse(['message' => 'Order saved', 'count' => count($ids)]);
+        }
+
+        // Save the pastor's hand-picked order of PEOPLE inside one group.
+        if (($_GET['action'] ?? '') === 'reorder_members') {
+            $data = getRequestBody();
+            $gid = (int)($data['group_id'] ?? 0);
+            $ids = array_values(array_filter(array_map('intval', $data['member_ids'] ?? [])));
+            if (!$gid) jsonResponse(['error' => 'Group ID required'], 400);
+            if ($ids) {
+                $upd = $db->prepare("UPDATE member_groups SET position = ? WHERE group_id = ? AND member_id = ?");
+                foreach ($ids as $pos => $mid) $upd->execute([$pos, $gid, $mid]);
+            }
+            jsonResponse(['message' => 'Order saved', 'count' => count($ids)]);
+        }
+
+        // Set (or clear) one person's role/title INSIDE one group. Used by the
+        // little tag editor on the expanded Groups card.
+        if (($_GET['action'] ?? '') === 'set_title') {
+            $data = getRequestBody();
+            $gid = (int)($data['group_id'] ?? 0);
+            $mid = (int)($data['member_id'] ?? 0);
+            if (!$gid || !$mid) jsonResponse(['error' => 'Group and member required'], 400);
+            $title = trim((string)($data['function_title'] ?? ''));
+            $db->prepare("UPDATE member_groups SET function_title = ? WHERE group_id = ? AND member_id = ?")
+               ->execute([$title === '' ? null : $title, $gid, $mid]);
+            refreshMemberPrimaryTitle($db, $mid);
+            jsonResponse(['message' => 'Role saved']);
+        }
+
         if (!$id) jsonResponse(['error' => 'Group ID required'], 400);
         $data = getRequestBody();
 
